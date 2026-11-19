@@ -2,7 +2,7 @@ import { test, expect, afterAll } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-process.env.TRACE_LAB_DATA = mkdtempSync(join(tmpdir(), 'trace-lab-test-'));
+process.env.D_MESSAGE_DATA_DIR = mkdtempSync(join(tmpdir(), 'd-message-test-'));
 const { onRequest, onResponse } = await import('../capture.hooks.js');
 const { storage } = await import('../store.js');
 const { startService } = await import('../service.js');
@@ -50,14 +50,14 @@ afterAll(() => {
   service.stop(true);
   mock.stop(true);
   storage().close();
-  rmSync(process.env.TRACE_LAB_DATA, { recursive: true, force: true });
+  rmSync(process.env.D_MESSAGE_DATA_DIR, { recursive: true, force: true });
 });
 test('two concurrent calls survive stop, individual runs retain the exact draft sent', async () => {
   expect((await fetch(service.url + 'api/list')).status).toBe(401);
   const base = { model: 'mock', messages: [{ role: 'user', content: 'original' }], stream: false };
   const ctx = () => ({
     origin: 'local',
-    agent: 'artex',
+    agent: 'alpha-client',
     protocol: 'chat',
     session: 'same',
     state: {},
@@ -65,8 +65,8 @@ test('two concurrent calls survive stop, individual runs retain the exact draft 
   await onRequest(base, { ...ctx(), agent: 'z-client' });
   await onRequest(base, ctx());
   const scope = (await api('capture-scope'))[1];
-  expect(scope.scope).toEqual({ agents: ['artex'] });
-  expect(scope.choices.agents).toEqual(['artex', 'claude', 'codex', 'z-client']);
+  expect(scope.scope).toEqual({ agents: ['alpha-client'] });
+  expect(scope.choices.agents).toEqual(['alpha-client', 'claude', 'codex', 'z-client']);
   expect((await api('list'))[1].calls).toHaveLength(0);
   await api('recording', { enabled: true });
   const a = ctx(),
@@ -74,7 +74,7 @@ test('two concurrent calls survive stop, individual runs retain the exact draft 
   await Promise.all([
     onRequest(base, a),
     onRequest(base, b),
-    onRequest(base, { ...ctx(), agent: 'trace-lab' }),
+    onRequest(base, { ...ctx(), agent: 'other-client' }),
     onRequest(base, { ...ctx(), origin: 'remote' }),
   ]);
   await api('recording', { enabled: false });
@@ -278,16 +278,16 @@ test('HTTP MCP controls ports, snapshots, atomic patches and idempotent single-i
     ).toBe(true);
     const reset = await result('trace_record', {
       action: 'start',
-      scope: { agents: ['artex'] },
+      scope: { agents: ['alpha-client'] },
     });
-    expect(reset.scope.agents).toEqual(['artex']);
+    expect(reset.scope.agents).toEqual(['alpha-client']);
     await result('trace_record', { action: 'stop' });
     await onResponse({ choices: [] }, { ...accepted, success: true });
     expect((await api('calls/' + accepted.state.traceId))[1].status).toBe('complete');
     const { cursor } = await result('trace_record', { action: 'start' });
     const ctx = {
       origin: 'local',
-      agent: 'artex',
+      agent: 'alpha-client',
       protocol: 'chat',
       session: 'mcp-test',
       state: {},

@@ -24,7 +24,7 @@ const reply = (data) => ({
 const digest = (s) => createHash('sha256').update(s).digest();
 
 function toolsFor(upstream, captureState) {
-  const mcp = new McpServer({ name: 'd-message', title: 'D-message', version: '1.4.0' });
+  const mcp = new McpServer({ name: 'd-message', title: 'D-message', version: '1.4.1' });
   function tool(name, description, inputSchema, fn, readOnly = false) {
     mcp.registerTool(
       name,

@@ -5,9 +5,13 @@ import { mkdirSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const dataDir =
-  process.env.TRACE_LAB_DATA ||
-  join(homedir(), 'Library', 'Application Support', 'ARTEX Trace Lab');
+function defaultDataDir() {
+  if (process.platform === 'darwin') return join(homedir(), 'Library', 'Application Support', 'D-message');
+  if (process.platform === 'win32')
+    return join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'D-message');
+  return join(process.env.XDG_DATA_HOME || join(homedir(), '.local', 'share'), 'D-message');
+}
+export const dataDir = process.env.D_MESSAGE_DATA_DIR || defaultDataDir();
 let shared;
 
 export function isReplayAgent(id) {
@@ -49,16 +53,7 @@ export function storage() {
       db.exec("ALTER TABLE calls ADD COLUMN protocol TEXT NOT NULL DEFAULT 'chat'");
     if (!columns.includes('endpoint'))
       db.exec("ALTER TABLE calls ADD COLUMN endpoint TEXT NOT NULL DEFAULT '/v1/chat/completions'");
-    if (!columns.includes('agent')) {
-      db.exec(`ALTER TABLE calls ADD COLUMN agent TEXT;
-        INSERT OR IGNORE INTO capture_options SELECT 'agent','artex' WHERE EXISTS(SELECT 1 FROM calls);`);
-    }
-    // Before capture scopes, the hook admitted only ARTEX and omitted the agent
-    // column. The multi-agent hook always supplies a nonempty ctx.agent.
-    if (!db.query("SELECT 1 FROM settings WHERE key='legacy_artex_source'").get()) {
-      db.exec("UPDATE calls SET agent='artex' WHERE agent IS NULL");
-      db.query("INSERT INTO settings VALUES ('legacy_artex_source','1')").run();
-    }
+    if (!columns.includes('agent')) db.exec('ALTER TABLE calls ADD COLUMN agent TEXT');
     if (!columns.includes('last_role')) db.exec('ALTER TABLE calls ADD COLUMN last_role TEXT');
     if (!columns.includes('last_preview'))
       db.exec('ALTER TABLE calls ADD COLUMN last_preview TEXT');

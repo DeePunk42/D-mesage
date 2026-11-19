@@ -6,7 +6,7 @@
     "url": "git+https://github.com/DeePunk42/D-mesage.git"
   },
   "keywords": ["magpie-plugin", "magpie-page", "llm-debugging"],
-  "version": "1.4.0",
+  "version": "1.4.1",
   "type": "module",
   "main": "./plugin.js",
   "private": true,

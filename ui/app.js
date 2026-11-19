@@ -512,7 +512,6 @@ function resetHistory(cursor) {
   setWorkspace(workspace);
 }
 const agentBrands = new Map([
-  ['artex', { name: 'ARTEX' }],
   ['claude', { name: 'Claude Code', icon: 'claude' }],
   ['codex', { name: 'Codex', icon: 'codex' }],
   ['dsh', { name: 'DeepSeek Harness', icon: 'dsh' }],

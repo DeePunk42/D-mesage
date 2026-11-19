@@ -1,0 +1,82 @@
+diff --git a/internal/gateway/gateway_hook_test.go b/internal/gateway/gateway_hook_test.go
+index 3db85d2..bf1c511 100644
+--- a/internal/gateway/gateway_hook_test.go
++++ b/internal/gateway/gateway_hook_test.go
+@@ -21,6 +21,28 @@ import (
+ 	"github.com/yetone/magpie/internal/testenv"
+ )
+ 
++func TestGatewayHookResponsesStreamedItems(t *testing.T) {
++	const events = "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"name\":\"lookup\",\"arguments\":\"{}\"}}\n\n" +
++		"data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n"
++	for _, tc := range []struct{ terminal, want string }{
++		{`[]`, `[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},{"type":"function_call","name":"lookup","arguments":"{}"}]`},
++		{`[{"type":"reasoning","id":"rs1"}]`, `[{"type":"reasoning","id":"rs1"}]`},
++	} {
++		body := events + `data: {"type":"response.completed","response":{"status":"completed","output":` + tc.terminal + "}}\n\n"
++		reply, err := gatewayReply(provider.Responses, []byte(body))
++		if err != nil {
++			t.Fatal(err)
++		}
++		var r struct{ Output json.RawMessage }
++		if err := json.Unmarshal(reply, &r); err != nil || string(r.Output) != tc.want {
++			t.Fatalf("streamed output: %s, error: %v", r.Output, err)
++		}
++	}
++	if _, err := gatewayReply(provider.Responses, []byte(events)); err == nil {
++		t.Fatal("stream without completion was accepted")
++	}
++}
++
+ func TestAsyncGatewayResponseDoesNotHoldStream(t *testing.T) {
+ 	t.Setenv("MAGPIE_BUN", testenv.Bun(t))
+ 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+diff --git a/internal/gateway/gateway_hooks.go b/internal/gateway/gateway_hooks.go
+index 80b95ad..4fb3fad 100644
+--- a/internal/gateway/gateway_hooks.go
++++ b/internal/gateway/gateway_hooks.go
+@@ -51,6 +51,7 @@ func gatewayReply(proto provider.Protocol, body []byte) (json.RawMessage, error)
+ 	}
+ 	var c collector
+ 	var completed json.RawMessage
++	var items map[int]json.RawMessage
+ 	decode := decoder(proto)
+ 	ended := false
+ 	err := readSSE(bytes.NewReader(body), func(_ string, data string) error {
+@@ -63,11 +64,23 @@ func gatewayReply(proto provider.Protocol, body []byte) (json.RawMessage, error)
+ 		}
+ 		if proto == provider.Responses {
+ 			var e struct {
+-				Type     string          `json:"type"`
+-				Response json.RawMessage `json:"response"`
++				Type        string          `json:"type"`
++				Response    json.RawMessage `json:"response"`
++				Item        json.RawMessage `json:"item"`
++				OutputIndex int             `json:"output_index"`
+ 			}
+-			if json.Unmarshal([]byte(data), &e) == nil && e.Type == "response.completed" && len(e.Response) > 0 {
+-				completed = e.Response
++			if json.Unmarshal([]byte(data), &e) == nil {
++				switch e.Type {
++				case "response.output_item.done":
++					if len(e.Item) > 0 && e.OutputIndex >= 0 {
++						if items == nil {
++							items = make(map[int]json.RawMessage)
++						}
++						items[e.OutputIndex] = e.Item
++					}
++				case "response.completed":
++					completed = e.Response
++				}
+ 			}
+ 		}
+ 		return decode(data, func(e Event) {
+@@ -87,7 +100,7 @@ func gatewayReply(proto provider.Protocol, body []byte) (json.RawMessage, error)
+ 		return nil, errors.New(c.err)
+ 	}
+ 	if completed != nil {
+-		return completed, nil
++		return withStreamedOutput(completed, items), nil
+ 	}
+ 	res := c.finish()
+ 	return render(proto, res, &Request{Model: res.Model}), nil

@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>D-message</title>
+    <link rel="stylesheet" href="style.css" />
+    <script type="module" src="app.js"></script>
+  </head>
+  <body>
+    <header>
+      <h1>D-message</h1>
+      <nav aria-label="Workspaces">
+        <button id="toTrace" aria-pressed="true">Trace</button
+        ><button id="toRepeat" aria-pressed="false">Repeater</button
+        ><button id="toSettings" aria-pressed="false">Settings</button>
+      </nav>
+      <div class="recordbox">
+        <details id="scopeMenu">
+          <summary id="scopeSummary" aria-label="Capture scope" title="Capture scope"></summary>
+          <div class="scopePanel">
+            <div id="scopeFields"></div>
+            <p id="scopeError" role="status"></p>
+            <button id="scopeApply" class="primary" disabled>Apply scope</button>
+          </div>
+        </details>
+        <button id="record" disabled>Connecting…</button>
+      </div>
+    </header>
+    <p id="notice" role="status"></p>
+    <main id="trace" aria-label="Trace">
+      <aside id="traceList" class="traceList" aria-label="Request list">
+        <div class="traceTools">
+          <div class="filterBox">
+            <span id="filterChips"></span>
+            <input
+              type="search"
+              id="filter"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-controls="filterSuggestions"
+              aria-expanded="false"
+              aria-label="Filter records"
+              placeholder="Search traces"
+              title="Search all fields, or use request:, response: or tool: (/)"
+            />
+            <div id="filterSuggestions" role="listbox" aria-label="Search prefixes" hidden></div>
+          </div>
+          <select id="typeFilter" aria-label="Record type">
+            <option value="">All records</option>
+            <option value="capture">Captures</option>
+            <option value="repeater">Repeater</option>
+          </select>
+          <details id="filterMenu" class="popover">
+            <summary
+              id="filterButton"
+              class="iconButton"
+              aria-label="Filter and sort"
+              title="Filter and sort"
+            ></summary>
+            <div class="popup filterPanel">
+              <label
+                >Status<select id="statusFilter" aria-label="Filter by status">
+                  <option value="">All statuses</option>
+                  <option value="complete">Complete</option>
+                  <option value="incomplete">Incomplete</option>
+                  <option value="pending">Pending</option>
+                  <option value="running">Sending</option>
+                  <option value="failed">Failed</option>
+                </select></label
+              >
+              <label
+                >Sort<select id="sortField" aria-label="Sort by">
+                  <option value="time">Time</option>
+                  <option value="seq">Number</option>
+                  <option value="session">Session</option>
+                  <option value="model">Model</option>
+                  <option value="duration">Duration</option>
+                  <option value="status">Status</option>
+                </select></label
+              >
+              <button id="direction" aria-label="Reverse sort order"></button>
+            </div>
+          </details>
+        </div>
+        <div class="traceEvents">
+          <div id="calls" aria-label="Trace records"></div>
+          <p id="listEmpty" class="hint"></p>
+        </div>
+        <div class="listfoot">
+          <span id="count"></span
+          ><button id="clearHistory" title="Clear all trace history" disabled>Clear</button
+          ><button id="prev" aria-label="Previous page">‹</button
+          ><button id="next" aria-label="Next page">›</button>
+        </div>
+      </aside>
+      <div
+        id="traceHandle"
+        class="splitHandle"
+        role="separator"
+        tabindex="0"
+        aria-label="Resize the list and details panes"
+        aria-controls="traceList"
+        aria-orientation="vertical"
+        aria-valuemin="25"
+        aria-valuemax="75"
+        aria-valuenow="32"
+        title="Drag to resize. Double-click to reset."
+      ></div>
+      <div class="traceDetail">
+        <p id="emptyInspect" class="hint">Select a request</p>
+        <section id="inspector" hidden>
+          <div class="line">
+            <button id="backList">‹ Request list</button>
+            <h2 id="callTitle"></h2>
+            <span class="modelName" id="inspectModel"></span
+            ><button id="fork" class="primary right">Send to Repeater ↗</button>
+          </div>
+          <div class="panehead">
+            <div class="tabs" id="histTabs"></div>
+            <details class="popover" id="metaMenu">
+              <summary class="textAction" aria-label="Request details">Details</summary>
+              <dl class="popup facts" id="callMeta"></dl>
+            </details>
+          </div>
+          <div id="hitBar" hidden>
+            <code id="hitPath"></code><small id="hitCount"></small>
+            <button id="hitPrev" aria-label="Previous matching field">‹</button>
+            <button id="hitNext" aria-label="Next matching field">›</button>
+          </div>
+          <div id="inspectView" class="viewport"></div>
+        </section>
+      </div>
+    </main>
+    <main id="repeat" hidden>
+      <div class="tabstrip">
+        <div id="draftList" role="tablist" aria-label="Repeater drafts"></div>
+        <details id="tabMenu" class="popover">
+          <summary class="iconButton" aria-label="Tab actions" title="Tab actions">⋯</summary>
+          <div class="popup tabActions">
+            <button id="copyTab">Duplicate tab</button>
+            <button id="renameTab">Rename tab</button>
+            <button id="deleteTab">Delete draft</button>
+            <details id="recentTabs">
+              <summary>Recently closed</summary>
+              <div id="closedList"></div>
+            </details>
+          </div>
+        </details>
+      </div>
+      <section id="noDraft" class="blank">
+        <button id="pickTrace">Choose a request from Trace</button>
+      </section>
+      <section id="studio" hidden>
+        <div class="line">
+          <button id="saveStatus" title="Draft save status" hidden disabled>Saved</button>
+          <details class="popover" id="modelMenu">
+            <summary id="modelTrigger" title="Select replay model" aria-label="Select replay model">
+              <span id="draftModel" class="modelName"></span><span aria-hidden="true">▾</span>
+            </summary>
+            <div class="popup modelPanel">
+              <input type="search" id="modelSearch" placeholder="Find a model…" aria-label="Find a model">
+              <div id="modelChoices"></div>
+            </div>
+          </details>
+          <button
+            id="undo"
+            class="iconButton right"
+            aria-label="Undo"
+            title="Undo (Ctrl/⌘ Z)"
+            disabled
+          >
+            ↶</button
+          ><button
+            id="redo"
+            class="iconButton"
+            aria-label="Redo"
+            title="Redo (Ctrl/⌘ Shift Z)"
+            disabled
+          >
+            ↷</button
+          ><button id="send" class="primary" title="⌘ / Ctrl + Enter">Send</button>
+        </div>
+        <div class="split" id="repeatSplit">
+          <section id="requestPane">
+            <div class="panehead">
+              <h2>Request</h2>
+              <div class="tabs" id="draftTabs"></div>
+            </div>
+            <p id="warning" role="status"></p>
+            <div class="viewport" id="draftView"></div>
+          </section>
+          <div
+            id="splitHandle"
+            class="splitHandle"
+            role="separator"
+            tabindex="0"
+            aria-label="Resize the request and response panes"
+            aria-controls="requestPane"
+            aria-orientation="vertical"
+            aria-valuemin="25"
+            aria-valuemax="75"
+            aria-valuenow="50"
+            title="Drag to resize. Double-click for equal panes."
+          ></div>
+          <section>
+            <div class="panehead">
+              <h2>Run</h2>
+              <select id="runSelect" aria-label="Select run"></select>
+              <button id="restore" title="Restore the selected request as a draft">
+                Restore draft
+              </button>
+            </div>
+            <div class="panehead runTools">
+              <div class="tabs" id="runTabs"></div>
+              <small id="runMeta"></small>
+            </div>
+            <div id="runView" class="viewport"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+    <main id="settings" hidden>
+      <section class="mcpSettings">
+        <div class="settingsTitle">
+          <h2>MCP server</h2>
+          <small id="mcpStatus" role="status"></small>
+        </div>
+        <form id="mcpForm">
+          <label><input id="mcpEnabled" type="checkbox" /> Enable listener</label>
+          <label>Port <input id="mcpPort" type="number" min="1024" max="65535" required /></label>
+          <button class="primary" id="mcpApply">Save settings</button>
+        </form>
+        <label>Endpoint <input id="mcpUrl" readonly /></label>
+        <div class="line">
+          <button id="mcpCopy">Copy client config</button><button id="mcpReveal">Show token</button>
+        </div>
+        <input id="mcpToken" aria-label="MCP access token" readonly hidden />
+        <p id="mcpHint" role="status"></p>
+      </section>
+    </main>
+    <dialog id="editDialog">
+      <div class="panehead">
+        <h2 id="editTitle"></h2>
+        <button id="cancelEdit">Cancel</button>
+      </div>
+      <textarea readonly spellcheck="false" id="editValue" aria-label="Text to copy"></textarea>
+    </dialog>
+    <dialog id="nameDialog" aria-labelledby="nameTitle">
+      <h2 id="nameTitle">Rename tab</h2>
+      <input id="tabName" aria-label="Tab name" maxlength="100" />
+      <div class="line">
+        <button id="cancelName">Cancel</button
+        ><button id="applyName" class="primary">Rename</button>
+      </div>
+    </dialog>
+    <dialog id="confirmDialog" aria-labelledby="confirmMsg">
+      <p id="confirmMsg"></p>
+      <div class="line">
+        <button id="keep" autofocus>Cancel</button><button id="confirm" class="primary"></button>
+      </div>
+    </dialog>
+  </body>
+</html>

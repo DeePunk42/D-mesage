@@ -1,0 +1,40 @@
+{
+  "name": "d-message",
+  "description": "Capture, inspect, edit and replay LLM requests through Magpie.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DeePunk42/D-mesage.git"
+  },
+  "keywords": ["magpie-plugin", "magpie-page", "llm-debugging"],
+  "version": "1.4.0",
+  "type": "module",
+  "main": "./plugin.js",
+  "private": true,
+  "scripts": {
+    "test": "bun test",
+    "setup": "bun setup.js"
+  },
+  "magpie": {
+    "name": "D-message",
+    "icon": "https://raw.githubusercontent.com/DeePunk42/D-mesage/main/page/icon.svg",
+    "summary": {
+      "en": "Inspect LLM traffic and replay edited requests from a local workspace.",
+      "zh": "在本机查看大模型请求与响应，编辑请求并重放。"
+    },
+    "hooks": "./capture.hooks.js",
+    "page": {
+      "title": "D-message",
+      "icon": "page/icon.svg",
+      "file": "page/start.html",
+      "service": {
+        "port": 34891,
+        "option": "port"
+      }
+    }
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "diff": "9.0.0",
+    "zod": "4"
+  }
+}

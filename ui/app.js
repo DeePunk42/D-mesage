@@ -28,6 +28,7 @@ import { draftWriter } from './tab-save.js';
 import { searchConditions, searchHits, pointer } from './search.js';
 import { filterBox } from './filter-box.js';
 import { changesView } from './changes.js';
+import { laneLayout, sessionRowId } from './session-graph.js';
 import { modelPicker } from './model-picker.js';
 const $ = (id) => document.getElementById(id);
 const entryParams = new URLSearchParams(location.hash.slice(1));
@@ -363,7 +364,11 @@ function inspect(scroll = false) {
   $('callMeta').replaceChildren(
     ...facts.filter(([, v]) => v).flatMap(([k, v]) => [el('dt', k), el('dd', v)]),
   );
-  tabs('histTabs', ['Messages', 'Full JSON', 'Response'], hTab, (v) => {
+  const views = selected.session
+    ? ['This turn', 'Messages', 'Full JSON', 'Response']
+    : ['Messages', 'Full JSON', 'Response'];
+  if (!views.includes(hTab)) hTab = 'Messages';
+  tabs('histTabs', views, hTab, (v) => {
     hTab = v;
     inspect(true);
   });
@@ -386,27 +391,11 @@ function inspect(scroll = false) {
       box.querySelector('.searchTarget mark')?.scrollIntoView({ block: 'nearest' }),
     );
   } else if (hTab === 'Full JSON') box.append(jsonPanel(selected.body));
+  else if (hTab === 'This turn') renderTurn(box);
   else if (hTab === 'Response') {
     if (selected.response != null)
       box.append(responseContent(selected.response, selected.protocol, true));
-    else
-      box.append(
-        el(
-          'p',
-          selected.error ||
-            {
-              pending: 'Waiting for a response…',
-              running: 'Waiting for a response…',
-              incomplete:
-                selected.entry_type === 'capture' && selected.ended == null
-                  ? 'The capture ended without a completion callback. The model outcome is unknown.'
-                  : 'No complete response was captured.',
-              failed: 'The request failed before a response was saved.',
-            }[selected.status] ||
-            'No response body was saved.',
-          'hint',
-        ),
-      );
+    else box.append(noReply());
     if (scroll) box.scrollTop = 0;
   } else {
     const msgs = requestEntries(selected.protocol, selected.body).map((entry) => entry.message);
@@ -416,20 +405,295 @@ function inspect(scroll = false) {
       box.scrollTop = box.lastElementChild.offsetTop - box.offsetTop;
   }
 }
+function noReply() {
+  return el(
+    'p',
+    selected.error ||
+      {
+        pending: 'Waiting for a response…',
+        running: 'Waiting for a response…',
+        incomplete:
+          selected.entry_type === 'capture' && selected.ended == null
+            ? 'The capture ended without a completion callback. The model outcome is unknown.'
+            : 'No complete response was captured.',
+        failed: 'The request failed before a response was saved.',
+      }[selected.status] ||
+      'No response body was saved.',
+    'hint',
+  );
+}
+const trees = new Map();
+let activeGroup = null,
+  mainPathOnly = false;
+let rowIndex = new Map();
+const kindLabel = { retry: 'Retry', compacted: 'Compacted', branch: 'Branch', replay: 'Repeater' };
+const nodeRef = (n) => (n ? (n.entry_type === 'repeater' ? 'R' : '#') + n.seq : '');
+function describeNode(n, byId) {
+  const p = byId.get(n.parent),
+    ref = nodeRef(p);
+  const kept = p ? `kept ${n.kept} of ${p.items} items · +${n.added}` : '';
+  return {
+    root: n.main ? `Session start · ${n.items} items` : `Separate conversation · ${n.items} items`,
+    turn: `After ${ref} · +${n.added} items`,
+    retry: `Same request as ${ref}`,
+    compacted: `Compacted after ${ref} · ${kept}`,
+    branch: `Branched from ${ref} · ${kept}`,
+    replay: `Repeater run of ${ref}`,
+  }[n.kind];
+}
+function treeSignature(g) {
+  return [g.requests, g.replays, g.last, g.latest.status, g.latest.ended].join('|');
+}
+async function ensureTree(id, agent, session, sig) {
+  const cached = trees.get(id);
+  if (cached && (cached.sig === sig || cached.loading)) return;
+  trees.set(id, { ...cached, sig, loading: true });
+  try {
+    const data = await api('sessions/tree?' + new URLSearchParams({ agent: agent ?? '', session }));
+    trees.set(id, { sig, nodes: data.nodes, byId: new Map(data.nodes.map((n) => [n.id, n])) });
+  } catch (error) {
+    trees.delete(id);
+    throw error;
+  }
+  if (activeGroup?.id === id) paintTree();
+  const node = trees.get(id).byId.get(selected?.id);
+  if (node && (node.status !== selected.status || node.ended !== selected.ended)) {
+    const c = await loadEvent(node.id, node.entry_type);
+    if (c.id === selected?.id) {
+      selected = parseCall(c);
+      inspect();
+    }
+  } else if (node && hTab === 'This turn') inspect();
+}
+function treeEntry(id) {
+  for (const [gid, tree] of trees) {
+    const n = tree.byId?.get(id);
+    if (n)
+      return {
+        id,
+        entry_type: n.entry_type,
+        hit: rowIndex.get(gid)?.matches.find((m) => m.id === id)?.hit ?? null,
+      };
+  }
+}
+function previewLine(r, hit) {
+  const line = el('span', '', 'eventPreview');
+  if (hit) {
+    line.append(el('small', hit.side), el('span', hit.preview, 'snippet'));
+    line.title = pointer(hit.path);
+  } else line.append(roleBadge(r.last_role), el('span', r.last_preview || '—', 'snippet'));
+  if (r.status !== 'complete')
+    line.append(el('small', traceStatus(r), 'eventStatus ' + r.status));
+  return line;
+}
+function flatRow(r) {
+  const row = el('button', '', 'eventRow');
+  row.dataset.id = r.id;
+  row.setAttribute('aria-current', String(r.id === selected?.id));
+  const top = el('span', '', 'eventTop');
+  const replay = r.entry_type === 'repeater';
+  top.append(el('small', replay ? 'R' + r.seq + ' ← #' + r.call_seq : '#' + r.seq));
+  if (replay) top.append(el('span', 'Repeater', 'replayBadge'));
+  const title = el('b', r.agent || 'Unknown agent');
+  title.title = title.textContent;
+  top.append(title, el('time', time(r.started)));
+  row.title = [traceStatus(r), replay && 'Original request #' + r.call_seq, r.session]
+    .filter(Boolean)
+    .join(' · ');
+  row.append(top, previewLine(r, r.hit));
+  row.onclick = invoke(async () => {
+    await select(r.id);
+    $('trace').classList.add('showDetail');
+  });
+  row.ondblclick = invoke(() => select(r.id, true));
+  return row;
+}
+async function activateSession(g) {
+  activeGroup = g;
+  paintRows();
+  paintTree();
+  await select(g.latest.id);
+  $('trace').classList.add('showDetail');
+}
+function sessionRow(g) {
+  const row = el('button', '', 'eventRow sessionRow');
+  row.dataset.id = g.id;
+  row.setAttribute('aria-current', String(activeGroup?.id === g.id));
+  const top = el('span', '', 'eventTop');
+  const title = el('b', g.title || 'Session');
+  title.title = g.title || '';
+  top.append(el('span', '', 'sessionMark'), title, el('time', time(g.last)));
+  const meta = el('span', '', 'eventPreview sessionMeta');
+  meta.append(el('span', sessionCounts(g), 'snippet'));
+  if (g.status !== 'complete')
+    meta.append(el('small', traceStatus(g.latest), 'eventStatus ' + g.status));
+  row.title = 'Session ' + g.session;
+  row.append(top, meta);
+  row.onclick = invoke(() => activateSession(g));
+  return row;
+}
+function sessionCounts(g) {
+  return [
+    agentName(g.agent),
+    g.requests + (g.requests === 1 ? ' request' : ' requests'),
+    g.replays && g.replays + (g.replays === 1 ? ' replay' : ' replays'),
+    g.matches.length && g.matches.length + (g.matches.length === 1 ? ' match' : ' matches'),
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+const LANE = 12;
+function laneGutter(lane, width, flipped, n) {
+  const ns = 'http://www.w3.org/2000/svg',
+    w = width * LANE;
+  const box = el('span', '', 'laneGutter');
+  box.style.width = w + 'px';
+  const svg = document.createElementNS(ns, 'svg');
+  svg.setAttribute('viewBox', `0 0 ${w} 100`);
+  svg.setAttribute('preserveAspectRatio', 'none');
+  svg.setAttribute('aria-hidden', 'true');
+  if (flipped) svg.classList.add('flipped');
+  const x = (i) => i * LANE + LANE / 2;
+  const path = (d, i) => {
+    const line = document.createElementNS(ns, 'path');
+    line.setAttribute('d', d);
+    line.setAttribute('class', i === 0 ? 'mainLane' : 'sideLane');
+    svg.append(line);
+  };
+  for (const i of lane.through) path(`M${x(i)} 0V100`, i);
+  for (const i of lane.merges)
+    path(`M${x(i)} 0C${x(i)} 35 ${x(lane.lane)} 25 ${x(lane.lane)} 50`, i);
+  if (lane.up) path(`M${x(lane.lane)} 0V50`, lane.lane);
+  if (lane.down) path(`M${x(lane.lane)} 50V100`, lane.lane);
+  const dot = el('span', '', 'laneDot dot-' + (n.side ? 'side' : n.kind));
+  if (lane.lane === 0) dot.classList.add('onMain');
+  dot.style.left = x(lane.lane) + 'px';
+  box.append(svg, dot);
+  return box;
+}
+function treeRow(g, n, lane, width, flipped, byId) {
+  const hit = g.matches.find((m) => m.id === n.id);
+  const row = el('button', '', 'eventRow treeRow');
+  if (!n.main) row.classList.add('offMain');
+  if (hit) row.classList.add('hitRow');
+  row.dataset.id = n.id;
+  row.setAttribute('aria-current', String(n.id === selected?.id));
+  const body = el('span', '', 'treeBody');
+  const top = el('span', '', 'eventTop');
+  top.append(el('small', nodeRef(n)));
+  const label = n.side
+    ? 'Side'
+    : n.kind === 'root' && !n.main
+      ? 'Separate'
+      : kindLabel[n.kind];
+  if (label) top.append(el('span', label, 'kindBadge kind-' + (n.side ? 'side' : n.kind)));
+  top.append(el('span', '', 'grow'), el('time', time(n.started)));
+  body.append(top, previewLine(n, hit?.hit));
+  row.title = describeNode(n, byId);
+  row.append(laneGutter(lane, width, flipped, n), body);
+  row.onclick = invoke(async () => {
+    await select(n.id);
+    $('trace').classList.add('showDetail');
+  });
+  row.ondblclick = invoke(() => select(n.id, true));
+  return row;
+}
+function paintTree() {
+  const g = activeGroup;
+  $('traceRight').classList.toggle('noTree', !g);
+  const box = $('treeRows');
+  if (!g) return box.replaceChildren();
+  $('treeTitle').textContent = g.title || 'Session';
+  $('treeTitle').title = g.title || '';
+  $('treeMeta').textContent = sessionCounts(g);
+  $('mainOnly').checked = mainPathOnly;
+  const tree = trees.get(g.id),
+    sig = treeSignature(g);
+  if (tree?.sig !== sig) void ensureTree(g.id, g.agent, g.session, sig).catch(explain);
+  if (!tree?.nodes) return box.replaceChildren(el('p', 'Loading session…', 'hint treeHint'));
+  const focus = box.contains(document.activeElement),
+    scroll = box.scrollTop;
+  let nodes = tree.nodes
+    .slice()
+    .sort((a, b) => b.started - a.started || (b.entry_type === a.entry_type ? b.seq - a.seq : 0));
+  if (mainPathOnly) nodes = nodes.filter((n) => n.main);
+  const layout = laneLayout(nodes);
+  const flipped = sort === 'time' && asc;
+  const order = nodes.map((n, i) => [n, layout.rows[i]]);
+  if (flipped) order.reverse();
+  box.replaceChildren(
+    ...order.map(([n, lane]) => treeRow(g, n, lane, layout.width, flipped, tree.byId)),
+  );
+  box.scrollTop = scroll;
+  if (focus) box.querySelector('[aria-current=true]')?.focus({ preventScroll: true });
+}
+$('mainOnly').onchange = () => {
+  mainPathOnly = $('mainOnly').checked;
+  paintTree();
+};
+function renderTurn(box) {
+  const id = sessionRowId(selected.agent, selected.session);
+  const tree = trees.get(id),
+    node = tree?.byId?.get(selected.id);
+  if (!node) {
+    box.append(el('p', 'Loading session…', 'hint'));
+    if (!tree?.loading)
+      void ensureTree(id, selected.agent, selected.session, 'detail').catch(explain);
+    return;
+  }
+  const parent = tree.byId.get(node.parent);
+  const head = el('div', '', 'turnHead');
+  head.append(el('span', describeNode(node, tree.byId)));
+  if (parent) head.append(button('Go to ' + nodeRef(parent), invoke(() => select(parent.id))));
+  box.append(head);
+  if (node.entry_type === 'repeater')
+    box.append(
+      el('p', 'This run replays an edited request. Compare edits in Repeater → Changes.', 'hint'),
+    );
+  else {
+    const entries = requestEntries(selected.protocol, selected.body);
+    const key = selected.protocol === 'responses' ? 'input' : 'messages';
+    const lookup = toolLookup(entries.map((e) => e.message));
+    const fresh = entries
+      .map((e, i) => [e, i])
+      .filter(([e]) => e.key === key && (e.index ?? 0) >= node.kept);
+    if (!fresh.length) box.append(el('p', 'No new input items.', 'hint'));
+    fresh.forEach(([e, i], k) =>
+      box.append(
+        messageCard(e.message, i, fresh.length <= 3 || k === fresh.length - 1, null, lookup),
+      ),
+    );
+  }
+  box.append(sectionTitle('Reply'));
+  box.append(
+    selected.response != null ? responseContent(selected.response, selected.protocol) : noReply(),
+  );
+}
 function loadEvent(id, entryType) {
   return api((entryType === 'repeater' ? 'snapshot/' : 'calls/') + id);
 }
 async function select(id, open = false, jump = true) {
   const epoch = ++detailEpoch;
-  const row = rows.find((item) => item.id === id);
-  if (!row) return;
+  const row = rowIndex.get(id) ?? treeEntry(id);
+  if (!row || row.entry_type === 'session') return;
   const changed = selected?.id !== id;
   if (selected?.id !== id) {
     const c = await loadEvent(id, row.entry_type);
     if (epoch !== detailEpoch) return;
     selected = parseCall(c);
-    hTab = 'Messages';
+    hTab = selected.session ? 'This turn' : 'Messages';
+    const group = selected.session ? sessionRowId(selected.agent, selected.session) : null;
+    if (activeGroup?.id !== group) {
+      activeGroup = group ? (rowIndex.get(group) ?? activeGroup) : null;
+      if (activeGroup?.id !== group) activeGroup = null;
+      paintTree();
+    }
     for (const row of $('calls').children)
+      row.setAttribute(
+        'aria-current',
+        String(row.dataset.id === id || (!!group && row.dataset.id === group)),
+      );
+    for (const row of $('treeRows').children)
       row.setAttribute('aria-current', String(row.dataset.id === id));
   }
   if (changed || hitRecord !== id || hitQuery !== filters.query()) {
@@ -452,32 +716,11 @@ function paintRows() {
     focus = body.contains(document.activeElement);
   body.replaceChildren();
   for (const r of rows) {
-    const row = el('button', '', 'eventRow');
-    row.dataset.id = r.id;
-    row.setAttribute('aria-current', String(r.id === selected?.id));
-    const top = el('span', '', 'eventTop');
-    const replay = r.entry_type === 'repeater';
-    top.append(el('small', replay ? 'R' + r.seq + ' ← #' + r.call_seq : '#' + r.seq));
-    if (replay) top.append(el('span', 'Repeater', 'replayBadge'));
-    const title = el('b', r.agent || 'Unknown agent');
-    title.title = title.textContent;
-    top.append(title, el('time', time(r.started)));
-    const line = el('span', '', 'eventPreview');
-    if (r.hit) {
-      line.append(el('small', r.hit.side), el('span', r.hit.preview, 'snippet'));
-      line.title = pointer(r.hit.path);
-    } else line.append(roleBadge(r.last_role), el('span', r.last_preview || '—', 'snippet'));
-    line.append(el('small', traceStatus(r), 'eventStatus ' + r.status));
-    row.title = [traceStatus(r), replay && 'Original request #' + r.call_seq, r.session]
-      .filter(Boolean)
-      .join(' · ');
-    row.append(top, line);
-    row.onclick = invoke(async () => {
-      await select(r.id);
-      $('trace').classList.add('showDetail');
-    });
-    row.ondblclick = invoke(() => select(r.id, true));
-    body.append(row);
+    if (r.entry_type !== 'session') {
+      body.append(flatRow(r));
+      continue;
+    }
+    body.append(sessionRow(r));
   }
   if (focus) body.querySelector('[aria-current=true]')?.focus({ preventScroll: true });
 }
@@ -508,6 +751,9 @@ function resetHistory(cursor) {
     $(id).replaceChildren();
   delete $('runSelect').dataset.signature;
   $('inspector').hidden = true;
+  activeGroup = null;
+  trees.clear();
+  paintTree();
   $('trace').classList.remove('showDetail');
   setWorkspace(workspace);
 }
@@ -688,7 +934,19 @@ async function list() {
   paintRecording(data);
   if (offset !== oldOffset) return list();
   rows = data.calls;
-  if (query !== listQuery && !rows.some((row) => row.id === selected?.id)) {
+  rowIndex = new Map();
+  for (const r of rows) {
+    rowIndex.set(r.id, r);
+    if (r.entry_type === 'session')
+      rowIndex.set(r.latest.id, {
+        ...r.latest,
+        hit: r.matches.find((m) => m.id === r.latest.id)?.hit ?? (r.matches.length ? null : undefined),
+      });
+  }
+  const listed = (item) =>
+    !!item &&
+    (rowIndex.has(item.id) || (!!item.session && rowIndex.has(sessionRowId(item.agent, item.session))));
+  if (query !== listQuery && !listed(selected)) {
     detailEpoch++;
     selected = null;
     $('inspector').hidden = true;
@@ -717,19 +975,27 @@ async function list() {
   $('prev').disabled = !offset;
   $('next').disabled = !data.more;
   $('direction').textContent = asc ? '↑ Ascending' : '↓ Descending';
+  if (activeGroup) {
+    if (rowIndex.has(activeGroup.id)) activeGroup = rowIndex.get(activeGroup.id);
+    else if (queryChanged) activeGroup = null;
+  }
   const sig = JSON.stringify(rows);
   if (sig !== rowSignature) {
     rowSignature = sig;
     paintRows();
+    paintTree();
   }
-  if (!selected && rows.length) await select(rows[0].id);
-  else if (queryChanged && selected && rows.some((row) => row.id === selected.id)) {
+  if (!selected && rows.length) {
+    if (rows[0].entry_type === 'session') await activateSession(rows[0]);
+    else await select(rows[0].id);
+  }
+  else if (queryChanged && listed(selected)) {
     if (!q && activeHits.length) hTab = 'Messages';
     await select(selected.id, false, !!q);
     if (!activeHits.length) inspect();
   }
-  const row = rows.find((r) => r.id === selected?.id);
-  if (row && (row.status !== selected.status || row.ended !== selected.ended)) {
+  const row = rowIndex.get(selected?.id);
+  if (row && row.entry_type !== 'session' && (row.status !== selected.status || row.ended !== selected.ended)) {
     const c = await loadEvent(row.id, row.entry_type);
     if (c.id === selected?.id) {
       selected = parseCall(c);
@@ -1522,7 +1788,8 @@ function bindSplitter(split, handle, initial, stacked) {
     e.preventDefault();
   };
 }
-bindSplitter($('trace'), $('traceHandle'), 32);
+bindSplitter($('trace'), $('traceHandle'), 30);
+bindSplitter($('traceRight'), $('treeHandle'), 40);
 bindSplitter($('repeatSplit'), $('splitHandle'), 50, window.matchMedia('(max-width: 760px)'));
 $('filterButton').append(icon('sliders'));
 $('undo').replaceChildren(icon('undo'));
@@ -1662,14 +1929,17 @@ document.addEventListener(
     if (!tr) return;
     if (e.key === 'Enter') {
       e.preventDefault();
-      await select(tr.dataset.id, true);
+      if (tr.classList.contains('sessionRow')) await activateSession(rowIndex.get(tr.dataset.id));
+      else await select(tr.dataset.id, true);
     }
     if (['ArrowDown', 'ArrowUp'].includes(e.key)) {
       e.preventDefault();
-      const next = e.key === 'ArrowDown' ? tr.nextElementSibling : tr.previousElementSibling;
+      const all = [...tr.parentElement.querySelectorAll('.eventRow')];
+      const next = all[all.indexOf(tr) + (e.key === 'ArrowDown' ? 1 : -1)];
       if (next) {
         next.focus();
-        await select(next.dataset.id);
+        if (next.classList.contains('sessionRow')) await activateSession(rowIndex.get(next.dataset.id));
+        else await select(next.dataset.id);
       }
     }
   }),

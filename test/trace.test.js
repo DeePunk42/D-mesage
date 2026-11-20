@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 process.env.D_MESSAGE_DATA_DIR = mkdtempSync(join(tmpdir(), 'd-message-test-'));
 const { onRequest, onResponse } = await import('../capture.hooks.js');
-const { storage } = await import('../store.js');
+const { storage, dataDir } = await import('../store.js');
+// Bun shares modules across test files; never let tests reach the real history.
+if (dataDir !== process.env.D_MESSAGE_DATA_DIR) throw Error('Tests resolved the real data directory.');
 const { startService } = await import('../service.js');
 const { readReply } = await import('../replay.js');
 const seen = [];
@@ -59,7 +61,7 @@ test('two concurrent calls survive stop, individual runs retain the exact draft 
     origin: 'local',
     agent: 'alpha-client',
     protocol: 'chat',
-    session: 'same',
+    session: '',
     state: {},
   });
   await onRequest(base, { ...ctx(), agent: 'z-client' });
@@ -749,4 +751,50 @@ test('native SSE preserves content, thinking, tool inputs, outcome and usage; re
   );
   expect(resp.output).toEqual([item]);
   await expect(readReply(stream([done]), 'responses')).rejects.toThrow('interrupted');
+});
+
+test('session tree API indexes requests by session ID and rejects requests without one', async () => {
+  const { recordState } = await import('../trace-api.js');
+  const { backfillChains } = await import('../session-tree.js');
+  recordState('start', { agents: ['codex', 'claude', 'artex'] });
+  const msg = (role, text) => ({ type: 'message', role, content: [{ type: 'input_text', text }] });
+  const turn = async (agent, protocol, session, body) => {
+    const ctx = { origin: 'local', agent, protocol, session, state: {} };
+    await onRequest(body, ctx);
+    return ctx.state.traceId;
+  };
+  const base = [msg('developer', 'context'), msg('user', 'task')];
+  const one = [...base, { ...msg('assistant', 'step'), id: 'msg_1' }];
+  const first = await turn('codex', 'responses', 'tree-thread', { model: 'm', input: base });
+  const next = await turn('codex', 'responses', 'tree-thread', {
+    model: 'm',
+    input: [...one, msg('user', 'more')],
+  });
+  const compacted = await turn('codex', 'responses', 'tree-thread', {
+    model: 'm',
+    input: [msg('developer', 'context'), msg('user', 'summary')],
+  });
+  await turn('artex', 'chat', '', { model: 'm', messages: [{ role: 'user', content: 'x' }] });
+  recordState('stop');
+  expect(backfillChains(50)).toBeGreaterThanOrEqual(3);
+  const server = startService({ port, uiKey }, { upstream: mock.url.href, restoreMcp: false });
+  try {
+    const [code, tree] = await api('sessions/tree?agent=codex&session=tree-thread');
+    expect(code).toBe(200);
+    expect(tree.nodes.map((n) => [n.id, n.kind, n.parent, n.main])).toEqual([
+      [first, 'root', null, true],
+      [next, 'turn', first, true],
+      [compacted, 'compacted', next, true],
+    ]);
+    expect((await api('sessions/tree?agent=artex&session='))[0]).toBe(400);
+    const listed = (await api('list?type=capture'))[1].calls;
+    const group = listed.find((r) => r.entry_type === 'session' && r.session === 'tree-thread');
+    expect(group).toMatchObject({ agent: 'codex', requests: 3, title: 'task', status: 'pending' });
+    expect(group.latest.id).toBe(compacted);
+    expect(listed.some((r) => r.agent === 'artex' && r.entry_type === 'capture')).toBe(true);
+    const found = (await api('list?q=' + encodeURIComponent('request:summary')))[1].calls;
+    expect(found.filter((r) => r.session === 'tree-thread').map((r) => r.matches.map((m) => m.id))).toEqual([[compacted]]);
+  } finally {
+    await server.stop(true);
+  }
 });

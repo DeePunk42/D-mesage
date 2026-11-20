@@ -107,6 +107,30 @@
         aria-valuenow="32"
         title="Drag to resize. Double-click to reset."
       ></div>
+      <div id="traceRight" class="traceRight noTree">
+      <section id="treePane" class="treePane" aria-label="Session tree">
+        <div class="panehead treeHead">
+          <div class="treeHeading">
+            <h2 id="treeTitle"></h2>
+            <small id="treeMeta"></small>
+          </div>
+          <label class="mainOnly"><input type="checkbox" id="mainOnly" />Main path only</label>
+        </div>
+        <div id="treeRows" class="traceEvents" aria-label="Session requests"></div>
+      </section>
+      <div
+        id="treeHandle"
+        class="splitHandle"
+        role="separator"
+        tabindex="0"
+        aria-label="Resize the session tree and details panes"
+        aria-controls="treePane"
+        aria-orientation="vertical"
+        aria-valuemin="25"
+        aria-valuemax="75"
+        aria-valuenow="40"
+        title="Drag to resize. Double-click to reset."
+      ></div>
       <div class="traceDetail">
         <p id="emptyInspect" class="hint">Select a request</p>
         <section id="inspector" hidden>
@@ -130,6 +154,7 @@
           </div>
           <div id="inspectView" class="viewport"></div>
         </section>
+      </div>
       </div>
     </main>
     <main id="repeat" hidden>

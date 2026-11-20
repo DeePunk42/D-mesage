@@ -29,6 +29,7 @@ magpie plugin add github:DeePunk42/D-mesage
 
 ## 数据与范围
 
+- 带 session ID 的请求（例如 Codex 和 Claude Code）在 Trace 列表中合并为一行，以首条用户消息为标题；不带 session ID 的请求仍逐条显示。点击会话后，中栏按树状显示它的请求，最左侧泳道是主线；拖动中栏与详情之间的分隔线可调整宽度。每条请求接在它所延续的那条较早请求之后。主线没有继续的请求标为 **Side**，重复发送标为 **Retry**，大部分历史被替换标为 **Compacted**，其他改写标为 **Branch**，同一会话中无关的对话标为 **Separate**，重放标为 **Repeater**。勾选 **Main path only** 只看主线。选中请求后默认打开 **This turn**，只显示相对父请求新增的消息，下面是这次的回复。
 - 点击 Trace 的搜索框可选择 `request:`、`response:` 或 `tool:` 前缀。输入关键词后按空格或 Enter 生成标签，再添加下一项；同一记录须满足全部条件。用双引号搜索含空格的短语，如 `request:"blue sky" response:ok`。点击标签可编辑，点击 × 可删除。点击结果会定位并高亮命中字段，`‹` / `›` 切换匹配位置。
 - Repeater 左侧 **Request → Changes** 用统一 diff 显示当前草稿相对初始请求的增删行，未发送的修改也可查看。从 Trace 打开的录制或重放以该条记录的请求为基准，复制标签沿用同一来源。发送或在右侧切换历史运行都不会改变基准。
 

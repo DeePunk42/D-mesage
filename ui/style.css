@@ -1047,7 +1047,9 @@ dialog .panehead {
     grid-template-columns: minmax(0, 1fr);
   }
   #traceHandle,
-  #trace:not(.showDetail) .traceDetail,
+  .treePane,
+  #treeHandle,
+  #trace:not(.showDetail) .traceRight,
   #trace.showDetail .traceList {
     display: none;
   }
@@ -1257,4 +1259,161 @@ button.primary.danger {
 }
 .diffLine.deletion {
   background: light-dark(#ffe6e4, #492826);
+}
+.sessionMark {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.sessionMeta .snippet {
+  font-size: 11px;
+}
+.traceRight {
+  display: grid;
+  grid-template-columns: minmax(0, var(--first-share, 2fr)) 9px minmax(0, var(--second-share, 3fr));
+  min-width: 0;
+  min-height: 0;
+}
+.traceRight.noTree {
+  grid-template-columns: minmax(0, 1fr);
+}
+.traceRight.noTree > .treePane,
+.traceRight.noTree > #treeHandle {
+  display: none;
+}
+.treePane {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--canvas);
+}
+.treeHead {
+  justify-content: space-between;
+  border-bottom: 1px solid var(--line);
+}
+.treeHeading {
+  display: grid;
+  min-width: 0;
+}
+.treeHeading h2,
+.treeHeading small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mainOnly {
+  display: flex;
+  flex: none;
+  gap: 4px;
+  align-items: center;
+  color: var(--dim);
+  font-size: 11px;
+}
+.treeHint {
+  padding: 8px 12px;
+}
+.eventRow.treeRow {
+  display: flex;
+  gap: 6px;
+  padding: 0 10px;
+}
+.eventRow.treeRow[aria-current='true'] {
+  background: var(--selected);
+}
+.treeBody {
+  display: grid;
+  flex: 1;
+  gap: 4px;
+  min-width: 0;
+  padding: 6px 0;
+}
+.treeRow .grow {
+  flex: 1;
+}
+.offMain .treeBody {
+  opacity: 0.78;
+}
+.hitRow {
+  box-shadow: inset 2px 0 var(--key);
+}
+.laneGutter {
+  position: relative;
+  flex: none;
+  align-self: stretch;
+}
+.laneGutter svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.laneGutter svg.flipped {
+  transform: scaleY(-1);
+}
+.laneGutter path {
+  fill: none;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+.laneGutter .mainLane {
+  stroke: var(--accent);
+}
+.laneGutter .sideLane {
+  stroke: var(--dim);
+  opacity: 0.55;
+}
+.laneDot {
+  position: absolute;
+  top: 50%;
+  width: 8px;
+  height: 8px;
+  margin: -4px 0 0 -4px;
+  box-sizing: border-box;
+  border: 2px solid var(--dim);
+  border-radius: 50%;
+  background: var(--panel);
+}
+.laneDot.onMain {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.laneDot.dot-compacted {
+  border-radius: 1px;
+  transform: rotate(45deg);
+}
+.laneDot.dot-retry {
+  background: var(--panel);
+}
+.laneDot.dot-replay {
+  border-style: dashed;
+}
+.kindBadge {
+  flex: none;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  color: var(--dim);
+  font: 600 10px/1.6 var(--mono);
+}
+.kind-compacted,
+.kind-branch {
+  color: var(--key);
+}
+.turnHead {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 2px 0 10px;
+  color: var(--dim);
+  font-size: 12px;
+}
+@media (max-width: 560px) {
+  .traceRight {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }

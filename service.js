@@ -17,6 +17,8 @@ import { tabRequest } from './repeater-tabs.js';
 import { launch } from './replay.js';
 import { traceSearch } from './trace-search.js';
 import { requestPatch } from './request-diff.js';
+import { backfillChains, sessionTree } from './session-tree.js';
+import { groupRows } from './list-groups.js';
 
 const ui = resolve(dirname(fileURLToPath(import.meta.url)), 'ui');
 const digest = (v) => createHash('sha256').update(v).digest();
@@ -31,6 +33,7 @@ const assets = new Map([
   ['/search.js', 'search.js'],
   ['/filter-box.js', 'filter-box.js'],
   ['/changes.js', 'changes.js'],
+  ['/session-graph.js', 'session-graph.js'],
   ['/model-picker.js', 'model-picker.js'],
   ['/icons/codex.svg', 'icons/codex.svg'],
   ['/icons/claude.svg', 'icons/claude.svg'],
@@ -76,6 +79,34 @@ export function startService(options, overrides = {}) {
   }
   const mcp = new McpListener(token, upstream, captureState);
   const search = traceSearch(resolve(dataDir, 'traces.sqlite'));
+  // A title is the first user prompt that the main path went on from, so a
+  // client's own side requests (titles, suggestions) never name the session.
+  const titles = new Map();
+  function sessionTitle(row, db) {
+    const key = row.agent + '\u0000' + row.session,
+      sig = row.requests + ':' + row.latest.seq;
+    const cached = titles.get(key);
+    if (cached?.sig === sig) return cached.title;
+    let title = '';
+    try {
+      const prompt = sessionTree(row.agent ?? '', row.session, db).nodes.find(
+        (n) =>
+          n.main && n.children > 0 && n.last_role === 'user' && n.last_preview && !n.last_preview.startsWith('<'),
+      );
+      title = prompt?.last_preview ?? '';
+    } catch {}
+    title ||= row.latest.last_preview || '';
+    titles.set(key, { sig, title });
+    if (titles.size > 200) titles.delete(titles.keys().next().value);
+    return title;
+  }
+  const backfill = setInterval(() => {
+    try {
+      backfillChains();
+    } catch (error) {
+      console.error('D-message: session index failed', error.message);
+    }
+  }, 1500);
   const server = Bun.serve({
     port,
     hostname: '127.0.0.1',
@@ -135,6 +166,10 @@ export function startService(options, overrides = {}) {
         return send({ token: reloadToken(Date.now() + 12 * 60 * 60 * 1000) });
       const db = storage();
       try {
+        if (req.method === 'GET' && url.pathname === '/api/sessions/tree')
+          return send(
+            sessionTree(url.searchParams.get('agent') || '', url.searchParams.get('session') || '', db),
+          );
         if (req.method === 'GET' && url.pathname === '/api/models') {
           const res = await fetch(new URL('/v1/models', upstream), {
             headers: { Authorization: 'Bearer magpie-d-message' },
@@ -217,13 +252,16 @@ export function startService(options, overrides = {}) {
           const sql = `${timeline} SELECT * FROM events ${where} ORDER BY ${order} ${direction},started DESC,entry_type DESC,seq DESC`;
           const page = q
             ? await search.find({ sql, args, q, offset })
-            : db.transaction(() => ({
-                clearedThrough: clearedThrough(db),
-                calls: db.query(sql + ' LIMIT 100 OFFSET ?').all(...args, offset),
-                total: db
-                  .query(`${timeline} SELECT COUNT(*) AS n FROM events ${where}`)
-                  .get(...args).n,
-              }))();
+            : db.transaction(() => {
+                const entries = groupRows(db.query(sql).all(...args));
+                return {
+                  clearedThrough: clearedThrough(db),
+                  calls: entries.slice(offset, offset + 100),
+                  total: entries.length,
+                };
+              })();
+          for (const row of page.calls)
+            if (row.entry_type === 'session') row.title = sessionTitle(row, db);
           return send({
             recording: recording(db),
             scope: captureScope(db),
@@ -299,6 +337,7 @@ export function startService(options, overrides = {}) {
   return {
     url: server.url,
     stop(force) {
+      clearInterval(backfill);
       search.stop();
       mcp.stop(force);
       return server.stop(force);

@@ -43,6 +43,8 @@ export function storage() {
       selected_run TEXT NOT NULL DEFAULT 'original');
     CREATE INDEX IF NOT EXISTS tabs_source ON repeater_tabs(source_ref);
     CREATE TABLE IF NOT EXISTS repeat_keys(request_key TEXT PRIMARY KEY, source_ref TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(id));
+    CREATE TABLE IF NOT EXISTS call_chain(
+      call_id TEXT PRIMARY KEY REFERENCES calls(id) ON DELETE CASCADE, version INTEGER NOT NULL, chain BLOB NOT NULL);
     PRAGMA foreign_keys=ON;`);
   db.transaction(() => {
     const columns = db
@@ -54,6 +56,7 @@ export function storage() {
     if (!columns.includes('endpoint'))
       db.exec("ALTER TABLE calls ADD COLUMN endpoint TEXT NOT NULL DEFAULT '/v1/chat/completions'");
     if (!columns.includes('agent')) db.exec('ALTER TABLE calls ADD COLUMN agent TEXT');
+    db.exec('CREATE INDEX IF NOT EXISTS calls_thread ON calls(agent, session, started)');
     if (!columns.includes('last_role')) db.exec('ALTER TABLE calls ADD COLUMN last_role TEXT');
     if (!columns.includes('last_preview'))
       db.exec('ALTER TABLE calls ADD COLUMN last_preview TEXT');
@@ -113,7 +116,7 @@ export function clearHistory(db) {
       const cursor = captureCursor(db);
       db.query("DELETE FROM settings WHERE key='repeater_active'").run();
       db.exec(
-        'DELETE FROM repeat_keys; DELETE FROM runs; DELETE FROM repeater_tabs; DELETE FROM experiments; DELETE FROM calls;',
+        'DELETE FROM repeat_keys; DELETE FROM runs; DELETE FROM repeater_tabs; DELETE FROM experiments; DELETE FROM call_chain; DELETE FROM calls;',
       );
       db.query("INSERT OR REPLACE INTO settings VALUES ('cleared_cursor',?)").run(String(cursor));
       return { clearedThrough: cursor };

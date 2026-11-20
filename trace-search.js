@@ -1,6 +1,7 @@
 import { Worker, parentPort, workerData } from 'node:worker_threads';
 import { Database } from 'bun:sqlite';
 import { searchConditions, searchHits } from './ui/search.js';
+import { groupRows } from './list-groups.js';
 
 export function traceSearch(path) {
   let worker;
@@ -52,8 +53,7 @@ if (parentPort && workerData?.path) {
       }
       const matches = cache.get(cacheKey);
       const result = db.transaction(() => {
-        const calls = [];
-        let total = 0;
+        const matched = [];
         const version = db.query("SELECT value FROM settings WHERE key='cleared_cursor'").get();
         const clearedThrough = Number(version?.value || 0);
         const rows = db.query(options.sql).iterate(...options.args);
@@ -89,11 +89,16 @@ if (parentPort && workerData?.path) {
             matches.set(row.id, match);
           }
           if (!match.found) continue;
-          if (total >= options.offset && calls.length < 100)
-            calls.push({ ...row, hit: match.hit ?? null });
-          total++;
+          matched.push({ ...row, hit: match.hit ?? null });
         }
-        return { calls, total, clearedThrough, more: options.offset + calls.length < total };
+        const entries = groupRows(matched);
+        const calls = entries.slice(options.offset, options.offset + 100);
+        return {
+          calls,
+          total: entries.length,
+          clearedThrough,
+          more: options.offset + calls.length < entries.length,
+        };
       })();
       parentPort.postMessage({ id, result });
     } catch (error) {

@@ -6,13 +6,15 @@ Magpie 本地插件。用 **Trace** 录制和搜索经过网关的 Chat Completi
 
 ## 安装
 
-在已安装 Magpie 的电脑上运行：
+从 GitHub 安装固定版本：
 
 ```sh
-magpie plugin add github:DeePunk42/D-mesage
+magpie plugin add github:DeePunk42/D-mesage#v0.0.1
 ```
 
 在 Magpie 侧栏打开 **D-message**。首次打开时，插件通过 Magpie 生成并保存本机页面凭据。录制默认关闭。在 **Trace → Capture scope** 选择客户端，开启录制，再从该客户端通过 Magpie 发送请求。已在 Magpie 0.1.4520 上测试。
+
+npm 包名为 `magpie-page-d-message`。
 
 源码开发使用 Bun。在仓库根目录运行 `bun install --frozen-lockfile` 和 `bun test`。需要把工作目录注册为本机开发插件时，运行 `bun setup.js`。本地版与 GitHub 版使用同一个页面端口，请在同一台机器上只启用其中一个。
 

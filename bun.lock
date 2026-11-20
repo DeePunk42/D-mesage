@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "d-message",
+      "name": "magpie-page-d-message",
       "dependencies": {
         "@modelcontextprotocol/sdk": "1.32.2",
         "diff": "9.0.0",

@@ -3,6 +3,7 @@ import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WebStandardStreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js';
 import { z } from 'zod';
+import { version } from './package.json' with { type: 'json' };
 import { storage } from './store.js';
 import { scopeSchema, listTraces, getTrace, editTrace, repeatTrace } from './trace-api.js';
 
@@ -24,7 +25,7 @@ const reply = (data) => ({
 const digest = (s) => createHash('sha256').update(s).digest();
 
 function toolsFor(upstream, captureState) {
-  const mcp = new McpServer({ name: 'd-message', title: 'D-message', version: '1.4.1' });
+  const mcp = new McpServer({ name: 'd-message', title: 'D-message', version });
   function tool(name, description, inputSchema, fn, readOnly = false) {
     mcp.registerTool(
       name,

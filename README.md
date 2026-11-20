@@ -6,13 +6,15 @@ D-message is a local Magpie plugin for debugging LLM traffic. Use **Trace** to r
 
 ## Installation
 
-With Magpie installed, run:
+To install the tagged release from GitHub:
 
 ```sh
-magpie plugin add github:DeePunk42/D-mesage
+magpie plugin add github:DeePunk42/D-mesage#v0.0.1
 ```
 
 Open **D-message** in the Magpie sidebar. On first launch, the plugin creates a local credential and saves it through Magpie. Recording is off by default. Choose a client under **Trace → Capture scope**, turn recording on, and send a request from that client through its usual Magpie gateway. Tested with Magpie 0.1.4520.
+
+The npm package is named `magpie-page-d-message`.
 
 ## Trace
 

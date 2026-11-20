@@ -1,15 +1,16 @@
 {
-  "name": "d-message",
+  "name": "magpie-page-d-message",
   "description": "Capture, inspect, edit and replay LLM requests through Magpie.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/DeePunk42/D-mesage.git"
   },
   "keywords": ["magpie-plugin", "magpie-page", "llm-debugging"],
-  "version": "1.4.1",
+  "version": "0.0.1",
+  "license": "MIT",
   "type": "module",
   "main": "./plugin.js",
-  "private": true,
+  "files": ["*.js", "*.mjs", "page/", "ui/", "patches/", "README.zh-CN.md"],
   "scripts": {
     "test": "bun test",
     "setup": "bun setup.js"

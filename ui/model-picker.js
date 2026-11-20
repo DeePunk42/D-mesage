@@ -23,12 +23,7 @@ export function modelPicker({ menu, search, list, load, current, original, pick 
   function render() {
     const groups = new Map();
     const active = current(), seed = original(), needle = search.value.trim().toLowerCase();
-    const options = models.slice();
-    for (const id of [seed, active]) {
-      if (id && !options.some((m) => m.id === id))
-        options.unshift({ id, name: id, group: 'Request' });
-    }
-    for (const m of options) {
+    for (const m of models) {
       if (![m.id, m.name, m.group].some((v) => v.toLowerCase().includes(needle))) continue;
       if (!groups.has(m.group)) groups.set(m.group, []);
       groups.get(m.group).push(m);
@@ -60,7 +55,8 @@ export function modelPicker({ menu, search, list, load, current, original, pick 
     const request = ++epoch;
     if (!menu.open) return;
     search.value = '';
-    notice = models.length ? '' : 'Loading models…';
+    models = [];
+    notice = 'Loading models…';
     render();
     search.focus();
     try {

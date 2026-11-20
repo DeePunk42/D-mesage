@@ -1,26 +1,35 @@
+import { dshHost } from './dsh-host.js';
+import { outcomeWorker } from './gateway-outcome.js';
+import { createContinuations, replayAgentSettings, setReplayAgentPath } from './continue-agent.js';
+import { recoverCodexOutput } from './codex-reply.js';
+import { sessionTitles } from './session-titles.js';
 import { McpListener } from './mcp.js';
 import { timingSafeEqual, createHash, createHmac } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   storage,
+  checkLegacyOutcome,
+  outcomeEvents,
   backfillPreviews,
   recording,
   captureScope,
   clearedThrough,
   clearHistory,
   dataDir,
+  layoutPreferences,
+  saveViewPreference,
+  sessionDetailView,
   reconcile,
-  reconcileReplays,
 } from './store.js';
 import { gatewayAgents } from './agent-catalog.js';
-import { recordState, snapshot } from './trace-api.js';
+import { configureCaptureScope, recordState, snapshot } from './trace-api.js';
 import { tabRequest } from './repeater-tabs.js';
 import { launch, drainReplays, cancelQueuedRun } from './replay.js';
 import { traceSearch } from './trace-search.js';
 import { requestPatch } from './request-diff.js';
-import { backfillChains, sessionTree } from './session-tree.js';
-import { groupRows } from './list-groups.js';
+import { listFilter, pageRows, timeline } from './list-groups.js';
+import { requestHistory } from './ui/history-page.js';
 
 const ui = resolve(dirname(fileURLToPath(import.meta.url)), 'ui');
 const digest = (v) => createHash('sha256').update(v).digest();
@@ -31,6 +40,7 @@ const assets = new Map([
   ['/messages.js', 'messages.js'],
   ['/response-items.js', 'response-items.js'],
   ['/protocols.js', 'protocols.js'],
+  ['/history-page.js', 'history-page.js'],
   ['/prompt-syntax.js', 'prompt-syntax.js'],
   ['/views.js', 'views.js'],
   ['/search.js', 'search.js'],
@@ -38,6 +48,7 @@ const assets = new Map([
   ['/changes.js', 'changes.js'],
   ['/session-graph.js', 'session-graph.js'],
   ['/model-picker.js', 'model-picker.js'],
+  ['/continue-picker.js', 'continue-picker.js'],
   ['/icons/codex.svg', 'icons/codex.svg'],
   ['/icons/claude.svg', 'icons/claude.svg'],
   ['/icons/dsh.svg', 'icons/dsh.svg'],
@@ -47,18 +58,6 @@ for (const key of ['deepseek-color', 'openai', 'gemini-color', 'qwen-color', 'ki
   const file = `icons/${key}.svg`;
   assets.set('/' + file, file);
 }
-// Both branches return metadata only. A replay keeps its own ID, status and request preview.
-const timeline = `WITH events AS (
-  SELECT 'capture' AS entry_type, c.rowid AS seq, c.id, c.id AS call_id, c.rowid AS call_seq,
-    c.session,c.agent,c.model,c.protocol,c.endpoint,c.started,c.ended,c.status,c.last_role,c.last_preview,c.final_preview,c.preview_version,octet_length(c.request) AS bytes
-  FROM calls c
-  UNION ALL
-  SELECT 'repeater',r.rowid,r.id,c.id,c.rowid,c.session,c.agent,coalesce(r.model,c.model),c.protocol,c.endpoint,r.started,r.ended,r.status,
-    CASE WHEN r.kind='baseline' THEN c.last_role ELSE r.last_role END,
-    CASE WHEN r.kind='baseline' THEN c.last_preview ELSE r.last_preview END,r.final_preview,r.preview_version,
-    CASE WHEN r.kind='baseline' THEN octet_length(c.request) ELSE octet_length(e.body) END
-  FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id
-)`;
 export function startService(options, overrides = {}) {
   const port = Number(options.port || 34891);
   const token = options.uiKey;
@@ -76,33 +75,19 @@ export function startService(options, overrides = {}) {
       .update('tracefork-ui-reload:' + until)
       .digest('base64url');
   const refreshAgents = gatewayAgents(upstream);
+  const titleFor = sessionTitles();
   async function captureState(action, scope) {
     if (action === 'status' || action === 'start') await refreshAgents();
     return recordState(action, scope);
   }
+  const host = dshHost(undefined, resolve(dataDir, 'dsh-host.key'));
+  let continuations;
+  const chats = () => (continuations ??= createContinuations(storage(), {
+    port, upstream, uiKey: token, refreshAgents, host, ...overrides.continuations,
+  }));
   const mcp = new McpListener(token, upstream, captureState);
   const search = traceSearch(resolve(dataDir, 'traces.sqlite'));
-  // A title is the first user prompt that the main path went on from, so a
-  // client's own side requests (titles, suggestions) never name the session.
-  const titles = new Map();
-  function sessionTitle(row, db) {
-    const key = row.agent + '\u0000' + row.session,
-      sig = [row.requests, row.latest.seq, row.previewed].join(':');
-    const cached = titles.get(key);
-    if (cached?.sig === sig) return cached.title;
-    let title = '';
-    try {
-      const prompt = sessionTree(row.agent ?? '', row.session, db).nodes.find(
-        (n) =>
-          n.main && n.children > 0 && n.last_role === 'user' && n.last_preview && !n.last_preview.startsWith('<'),
-      );
-      title = prompt?.last_preview ?? '';
-    } catch {}
-    title ||= row.latest.last_preview || '';
-    titles.set(key, { sig, title });
-    if (titles.size > 200) titles.delete(titles.keys().next().value);
-    return title;
-  }
+  const sessionPages = traceSearch(resolve(dataDir, 'traces.sqlite'), 'tree');
   const server = Bun.serve({
     port,
     hostname: '127.0.0.1',
@@ -146,6 +131,9 @@ export function startService(options, overrides = {}) {
           "; base-uri 'none'; form-action 'none'";
         return new Response(file, { headers });
       }
+      if (url.pathname.startsWith('/branch/')) {
+        return chats().serve(req, url.pathname, () => server.timeout(req, 0));
+      }
       const auth = req.headers.get('authorization') || '';
       const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
       const master = timingSafeEqual(digest(bearer), keyHash);
@@ -162,10 +150,43 @@ export function startService(options, overrides = {}) {
         return send({ token: reloadToken(Date.now() + 12 * 60 * 60 * 1000) });
       const db = storage();
       try {
+        if (url.pathname === '/api/settings/replay') {
+          if (req.method === 'GET') return send(['codex','claude'].map(id => replayAgentSettings(db, id)));
+          if (req.method === 'POST') {
+            const {id, path} = await req.json();
+            return send(setReplayAgentPath(db, id, path));
+          }
+        }
+        if (url.pathname === '/api/settings/dsh') {
+          if (req.method === 'GET') return send(await host.settings());
+          if (req.method === 'POST') {
+            const config = await req.json();
+            return send(config.disconnect ? host.disconnect() : await host.connect(config));
+          }
+        }
+        if (req.method === 'POST' && url.pathname === '/api/view-preferences')
+          return send(saveViewPreference(db, await req.json()));
         if (req.method === 'GET' && url.pathname === '/api/sessions/tree')
-          return send(
-            sessionTree(url.searchParams.get('agent') || '', url.searchParams.get('session') || '', db),
-          );
+          return send(await sessionPages.find({
+            agent: url.searchParams.get('agent') || '',
+            session: url.searchParams.get('session') || '',
+            before: url.searchParams.get('before'),
+            focus: url.searchParams.get('focus'),
+            activeOnly: url.searchParams.get('active') === '1',
+            paged: url.searchParams.has('page'),
+          }));
+        const chatStatus = /^\/api\/continue-status\/([\da-f-]{36})$/.exec(url.pathname);
+        if (chatStatus && req.method === 'GET') {
+          const row = db.query('SELECT state,error,tool_receipt AS toolReceipt FROM agent_chats WHERE id=?').get(chatStatus[1]);
+          return row ? send(row) : send({ error: 'Chat no longer exists.' }, 404);
+        }
+        const chatMatch = /^\/api\/continue\/((?:capture\/)?[\da-f-]{36})$/.exec(url.pathname);
+        if (chatMatch && req.method === 'GET') return send(await chats().options(chatMatch[1]));
+        if (chatMatch && req.method === 'POST') {
+          const args = await req.json();
+          if (['dsh','codex'].includes(args.target)) server.timeout(req, 0);
+          return send(await chats().start(chatMatch[1], args), 202);
+        }
         if (req.method === 'GET' && url.pathname === '/api/models') {
           const res = await fetch(new URL('/v1/models', upstream), {
             headers: { Authorization: 'Bearer magpie-d-message' },
@@ -204,7 +225,10 @@ export function startService(options, overrides = {}) {
             });
           }
           if (req.method === 'GET' && action === 'workspace')
-            return send(tabRequest(action, {}, upstream));
+            return send({
+              ...tabRequest(action, { defer: url.searchParams.get('defer') === '1' }, upstream),
+              splits: layoutPreferences(db),
+            });
           if (req.method === 'GET' && action === 'runs')
             return send(tabRequest(action, { id: url.searchParams.get('id') }, upstream));
           if (req.method === 'POST' && !['workspace', 'runs'].includes(action))
@@ -213,7 +237,7 @@ export function startService(options, overrides = {}) {
         }
         if (url.pathname === '/api/capture-scope') {
           if (req.method === 'GET') return send(await captureState('status'));
-          if (req.method === 'POST') return send(recordState('configure', await req.json()));
+          if (req.method === 'POST') return send(configureCaptureScope(await req.json()));
         }
         if (url.pathname === '/api/settings/mcp') {
           if (req.method === 'GET') return send(mcp.state());
@@ -243,27 +267,28 @@ export function startService(options, overrides = {}) {
           const order = columns.get(url.searchParams.get('sort')) || 'started';
           const direction = url.searchParams.get('asc') === '1' ? 'ASC' : 'DESC';
           const type = url.searchParams.get('type') || '';
-          const where = "WHERE (?='' OR entry_type=?) AND (?='' OR status=?)";
           const args = [type, type, status, status];
-          const sql = `${timeline} SELECT * FROM events ${where} ORDER BY ${order} ${direction},started DESC,entry_type DESC,seq DESC`;
           const page = q
-            ? await search.find({ sql, args, q, offset })
-            : db.transaction(() => {
-                const entries = groupRows(db.query(sql).all(...args));
-                return {
-                  clearedThrough: clearedThrough(db),
-                  calls: entries.slice(offset, offset + 100),
-                  total: entries.length,
-                };
-              })();
-          for (const row of page.calls) {
-            if (row.entry_type !== 'session') continue;
-            row.title = sessionTitle(row, db);
+            ? await search.find({
+                sql: `${timeline} SELECT * FROM events ${listFilter} ORDER BY ${order} ${direction},started DESC,entry_type DESC,seq DESC`,
+                args, q, offset,
+              })
+            : db.transaction(() => ({
+                clearedThrough: clearedThrough(db),
+                ...pageRows(db, order, direction, args, offset),
+              }))();
+          const firstPrompt = db.query(`SELECT last_preview FROM calls
+            WHERE agent IS ? AND session=? AND last_role='user' AND last_preview<>'' AND substr(last_preview,1,1)<>'<'
+            ORDER BY started,rowid LIMIT 1`);
+          const latestCapture = db.query(`SELECT rowid AS seq FROM calls WHERE agent IS ? AND session=?
+            ORDER BY started DESC,rowid DESC LIMIT 1`);
+          await Promise.all(page.calls.filter(row => row.entry_type === 'session').map(async row => {
+            row.title = await titleFor(row.agent, row.session) ||
+              firstPrompt.get(row.agent, row.session)?.last_preview || row.latest.last_preview || '';
             // A new capture can move the active branch without matching the list filter.
             if (q || type || status)
-              row.activitySeq = db.query('SELECT rowid AS seq FROM calls WHERE agent=? AND session=? ORDER BY started DESC,rowid DESC LIMIT 1')
-                .get(row.agent, row.session)?.seq;
-          }
+              row.activitySeq = latestCapture.get(row.agent, row.session)?.seq;
+          }));
           return send({
             recording: recording(db),
             scope: captureScope(db),
@@ -285,14 +310,31 @@ export function startService(options, overrides = {}) {
         const match = url.pathname.match(/^\/api\/(calls|runs|send|snapshot|cancel)\/([\da-f-]{36})$/);
         if (!match) return send({ error: 'Not found' }, 404);
         const [, action, id] = match;
+        const part = url.searchParams.get('part') || '';
+        if (part && !['meta', 'request', 'reply', 'history'].includes(part))
+          return send({ error: 'Invalid record part.' }, 400);
+        const includeRequest = part === '' || part === 'request' || part === 'history';
+        const includeReply = part === '' || part === 'reply';
+        const before = url.searchParams.get('before');
+        const historyPage = (row) =>
+          requestHistory(row.protocol, JSON.parse(row.request))(before === null ? undefined : Number(before));
         if (action === 'calls' && req.method === 'GET') {
+          if (includeReply || part === 'meta') checkLegacyOutcome(db, id);
           const call = db
             .query(
-              "SELECT 'capture' AS entry_type,rowid AS seq,id,session,agent,model,protocol,endpoint,started,ended,status,request,reply FROM calls WHERE id=?",
+              `SELECT 'capture' AS entry_type,rowid AS seq,id,session,agent,model,protocol,endpoint,started,ended,status
+               ${includeRequest ? ',request' : ''}${includeReply ? ',reply,failure' : ''} FROM calls WHERE id=?`,
             )
             .get(id);
           if (!call) return send({ error: 'Request not found' }, 404);
-          return send(call);
+          if (call.failure) call.failure = JSON.parse(call.failure);
+          if (part === 'history') return send(historyPage(call));
+          const recovered = includeReply ? await recoverCodexOutput(call) : [];
+          return send({
+            ...call,
+            detail_view: sessionDetailView(db, call),
+            ...(recovered.length ? { recovered_output: recovered } : {}),
+          });
         }
         if (action === 'runs' && req.method === 'GET') {
           reconcile();
@@ -314,16 +356,23 @@ export function startService(options, overrides = {}) {
             db
               .query(
                 `SELECT r.id,r.rowid AS seq,'repeater' AS entry_type,c.id AS call_id,c.rowid AS call_seq,
-                  c.session,c.agent,coalesce(r.model,c.model) AS model,c.protocol,c.endpoint,r.kind,r.started,r.ended,r.status,r.reply,r.error,r.failure,CASE WHEN r.kind='baseline' THEN c.request ELSE e.body END AS request FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id WHERE r.id=?`,
+                  c.session,c.agent,coalesce(r.model,c.model) AS model,c.protocol,c.endpoint,r.kind,r.started,r.ended,r.status
+                  ${includeReply ? ',r.reply,r.error,r.failure' : ''}
+                  ${includeRequest ? ",CASE WHEN r.kind='baseline' THEN c.request ELSE e.body END AS request" : ''}
+                  FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id WHERE r.id=?`,
               )
               .get(id) ||
             db
               .query(
-                "SELECT id,'draft' AS status,body AS request,NULL AS reply FROM experiments WHERE id=?",
+                `SELECT id,'draft' AS status${includeRequest ? ',body AS request' : ''}
+                 ${includeReply ? ',NULL AS reply' : ''} FROM experiments WHERE id=?`,
               )
               .get(id);
           if (row?.failure) row.failure = JSON.parse(row.failure);
-          return row ? send(row) : send({ error: 'Record not found' }, 404);
+          if (row && part === 'history') return send(historyPage(row));
+          return row
+            ? send({ ...row, detail_view: sessionDetailView(db, row) })
+            : send({ error: 'Record not found' }, 404);
         }
         if (action === 'send' && req.method === 'POST') {
           const call = db.query('SELECT id,model,protocol,endpoint FROM calls WHERE id=?').get(id);
@@ -337,29 +386,35 @@ export function startService(options, overrides = {}) {
       }
     },
   });
-  function resumeReplays() {
-    const db = storage();
-    reconcileReplays(db);
-    drainReplays(db);
+  const outcomes = overrides.restoreMcp !== false ? outcomeWorker(storage(), upstream) : null;
+  if (outcomes) outcomeEvents.addEventListener('checking', outcomes.tick);
+  function resumeJobs() {
+    reconcile();
+    outcomes.tick();
+    drainReplays(storage());
   }
   const backfill = setInterval(() => {
     try {
-      if (overrides.restoreMcp !== false) resumeReplays();
+      if (outcomes) resumeJobs();
       backfillPreviews();
-      backfillChains();
     } catch (error) {
       console.error('D-message: background processing failed', error.message);
     }
   }, 1500);
-  if (overrides.restoreMcp !== false) {
-    resumeReplays();
+  if (outcomes) {
+    resumeJobs();
     mcp.restore();
   }
   return {
     url: server.url,
     stop(force) {
       clearInterval(backfill);
+      if (outcomes) {
+        outcomeEvents.removeEventListener('checking', outcomes.tick);
+        outcomes.stop();
+      }
       search.stop();
+      sessionPages.stop();
       mcp.stop(force);
       return server.stop(force);
     },

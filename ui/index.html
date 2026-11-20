@@ -66,6 +66,8 @@
                   <option value="complete">Complete</option>
                   <option value="incomplete">Incomplete</option>
                   <option value="pending">Pending</option>
+                  <option value="checking">Checking outcome</option>
+                  <option value="unconfirmed">Completion unconfirmed</option>
                   <option value="queued">Queued</option>
                   <option value="running">Running</option>
                   <option value="canceled">Canceled</option>
@@ -146,10 +148,13 @@
           </div>
           <div class="panehead">
             <div class="tabs" id="histTabs"></div>
-            <details class="popover" id="metaMenu">
-              <summary class="textAction" aria-label="Request details">Details</summary>
-              <dl class="popup facts" id="callMeta"></dl>
-            </details>
+            <div class="detailActions">
+              <details class="popover" id="metaMenu">
+                <summary class="textAction" aria-label="Request details">Details</summary>
+                <dl class="popup facts" id="callMeta"></dl>
+              </details>
+              <button id="traceFormat" class="editTool formatToggle" type="button" hidden>{}</button>
+            </div>
           </div>
           <div id="hitBar" hidden>
             <code id="hitPath"></code><small id="hitCount"></small>
@@ -167,6 +172,8 @@
         <details id="tabMenu" class="popover">
           <summary class="iconButton" aria-label="Tab actions" title="Tab actions">⋯</summary>
           <div class="popup tabActions">
+            <button id="undo" disabled title="Undo (Ctrl/⌘ Z)">Undo</button>
+            <button id="redo" disabled title="Redo (Ctrl/⌘ Shift Z)">Redo</button>
             <button id="copyTab">Duplicate tab</button>
             <button id="renameTab">Rename tab</button>
             <button id="deleteTab">Delete draft</button>
@@ -181,43 +188,40 @@
         <button id="pickTrace">Choose a request from Trace</button>
       </section>
       <section id="studio" hidden>
-        <div class="line">
-          <button id="saveStatus" title="Draft save status" hidden disabled>Saved</button>
-          <details class="popover" id="modelMenu">
-            <summary id="modelTrigger" title="Select replay model" aria-label="Select replay model">
-              <span id="draftModel" class="modelName"></span><span aria-hidden="true">▾</span>
-            </summary>
-            <div class="popup modelPanel">
-              <input type="search" id="modelSearch" placeholder="Find a model…" aria-label="Find a model">
-              <div id="modelChoices"></div>
-            </div>
-          </details>
-          <button
-            id="undo"
-            class="iconButton right"
-            aria-label="Undo"
-            title="Undo (Ctrl/⌘ Z)"
-            disabled
-          >
-            ↶</button
-          ><button
-            id="redo"
-            class="iconButton"
-            aria-label="Redo"
-            title="Redo (Ctrl/⌘ Shift Z)"
-            disabled
-          >
-            ↷</button
-          ><button id="send" class="primary" title="⌘ / Ctrl + Enter">Send</button>
-        </div>
         <div class="split" id="repeatSplit">
           <section id="requestPane">
-            <div class="panehead">
+            <div class="panehead repeatToolbar">
               <h2>Request</h2>
-              <div class="tabs" id="draftTabs"></div>
+              <details class="popover" id="modelMenu">
+                <summary id="modelTrigger" title="Select replay model" aria-label="Select replay model">
+                  <span id="draftModel" class="modelName"></span><span aria-hidden="true">▾</span>
+                </summary>
+                <div class="popup modelPanel">
+                  <input type="search" id="modelSearch" placeholder="Find a model…" aria-label="Find a model">
+                  <div id="modelChoices"></div>
+                </div>
+              </details>
+              <div class="detailActions">
+                <button id="draftFormat" type="button" class="editTool formatToggle" aria-pressed="false" aria-label="Full request JSON" title="Full request JSON">{}</button>
+                <button id="draftChanges" type="button" class="textAction" aria-pressed="false">Changes</button>
+              </div>
             </div>
+            <button id="saveStatus" hidden>Save failed · Retry</button>
             <p id="warning" role="status"></p>
             <div class="viewport" id="draftView"></div>
+            <small id="continueMessage" role="status"></small>
+            <footer class="requestSendBar">
+              <div id="continueControls" class="continueSplit" role="group" aria-label="Send to agent" hidden>
+                <button id="continueAgent" type="button" disabled>Send to agent</button>
+                <details id="continueMenu" class="popover">
+                  <summary aria-label="Select target agent" title="Select target agent" aria-controls="continueChoices">
+                    <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 6 4 4 4-4"/></svg>
+                  </summary>
+                  <div id="continueChoices" class="popup continueChoices"></div>
+                </details>
+              </div>
+              <button id="send" class="primary" title="Send to model (Ctrl/⌘ Enter)">Send to model</button>
+            </footer>
           </section>
           <div
             id="splitHandle"
@@ -233,45 +237,89 @@
             title="Drag to resize. Double-click for equal panes."
           ></div>
           <section>
-            <div class="panehead">
-              <h2>Run</h2>
+            <div class="panehead repeatToolbar">
+              <h2 id="replyTitle">Reply</h2>
               <select id="runSelect" aria-label="Select run"></select>
-              <button id="restore" title="Restore the selected request as a draft">
-                Restore draft
-              </button>
-            </div>
-            <div class="panehead runTools">
-              <div class="tabs" id="runTabs"></div>
-              <small id="runMeta"></small>
+              <div class="detailActions">
+                <button id="runFormat" class="editTool formatToggle" type="button" hidden>{}</button>
+                <button id="backToReply" class="textAction" hidden>Back to reply</button>
+                <details id="runMenu" class="popover">
+                  <summary class="iconButton" aria-label="Run actions" title="Run actions">⋯</summary>
+                  <div class="popup tabActions runActions">
+                    <button id="viewSnapshot">View request snapshot</button>
+                    <button id="restore">Restore draft</button>
+                  </div>
+                </details>
+              </div>
             </div>
             <div id="runView" class="viewport"></div>
+            <small id="runMeta"></small>
           </section>
         </div>
       </section>
     </main>
     <main id="settings" hidden>
-      <section class="mcpSettings">
-        <div class="settingsTitle">
-          <h2>MCP server</h2>
-          <small id="mcpStatus" role="status"></small>
+      <div class="settingsPage">
+        <h1>Settings</h1>
+      <section aria-labelledby="replaySettingsTitle">
+        <h2 id="replaySettingsTitle">Replay agents</h2>
+        <div class="settingsGroup">
+          <details class="replayAgent">
+            <summary class="agentHeading"><img src="icons/dsh.svg" alt="" /><span class="agentTitle">DeepSeek Harness</span>
+              <small id="dshStatus" class="connectionState" role="status"></small></summary>
+            <form id="dshForm" class="agentFields">
+              <div class="credentialLabel"><label for="dshCookie">Credential</label>
+                <button type="button" class="helpButton" id="dshHelpToggle" aria-label="How to get a DSH credential" aria-expanded="false" aria-controls="dshGrantHelp">?</button>
+              </div>
+              <div id="dshGrantHelp" class="grantHelp" hidden>
+                <strong>Get a DSH credential</strong>
+                <p>On macOS with Desktop 0.2.2-rc.5, finish active tasks, quit DSH with ⌘Q, then run this in Terminal.</p>
+                <code>"/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness"</code>
+                <p>Paste the full URL after <code>dsh web:</code> below. For DSH Web, use the URL in its startup terminal.</p>
+              </div>
+              <div class="agentInputRow">
+                <input id="dshCookie" type="password" autocomplete="off" spellcheck="false" placeholder="Launch URL, token, or cookie" required />
+                <button class="primary" id="dshConnect">Connect</button>
+              </div>
+              <details class="hostDetails"><summary>Host</summary>
+                <label for="dshUrl" class="agentLabel">Local address</label>
+                <input id="dshUrl" autocomplete="off" spellcheck="false" placeholder="Auto-detect local desktop" />
+              </details>
+              <button id="dshDisconnect" class="forgetGrant" type="button" hidden>Forget credential</button>
+              <small id="dshFeedback" class="agentFeedback" role="status" hidden></small>
+            </form>
+          </details>
+          <div id="nativeReplaySettings"></div>
         </div>
+      </section>
+      <section aria-labelledby="mcpSettingsTitle">
+        <h2 id="mcpSettingsTitle">MCP server</h2>
         <form id="mcpForm" class="settingsGroup">
-          <label class="settingsRow">Enable listener <input id="mcpEnabled" type="checkbox" role="switch" /></label>
+          <div class="settingsRow">
+            <div class="settingName"><label for="mcpEnabled">Enable listener</label>
+              <small id="mcpStatus" class="connectionState" role="status"></small></div>
+            <input id="mcpEnabled" type="checkbox" role="switch" aria-describedby="mcpStatus" />
+          </div>
           <div class="settingsRow">
             <label for="mcpPort">Port</label>
             <input id="mcpPort" type="number" min="1024" max="65535" required />
-            <button class="primary" id="mcpApply">Save settings</button>
+            <button class="primary" id="mcpApply" hidden>Apply</button>
           </div>
         </form>
         <div class="settingsGroup">
-          <label class="settingsRow">Endpoint <input id="mcpUrl" readonly /></label>
-          <div class="settingsRow tokenActions">
-            <button id="mcpCopy">Copy client config</button><button id="mcpReveal">Show token</button>
+          <div class="settingsRow">
+            <div class="settingName"><label for="mcpUrl">Endpoint</label><input id="mcpUrl" readonly /></div>
+            <button id="mcpCopy">Copy client config</button>
+          </div>
+          <div class="settingsRow">
+            <label for="mcpToken">Access token</label>
+            <button id="mcpReveal" aria-controls="mcpToken" aria-expanded="false">Show token</button>
           </div>
           <input id="mcpToken" aria-label="MCP access token" readonly hidden />
         </div>
         <p id="mcpHint" role="status"></p>
       </section>
+      </div>
     </main>
     <dialog id="editDialog">
       <div class="panehead">

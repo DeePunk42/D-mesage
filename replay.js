@@ -6,7 +6,7 @@ import { storage } from './store.js';
 
 // Only client-side function declarations are supported. Each run ends at the first reply.
 const chatFields = new Set(
-  'model messages tools tool_choice parallel_tool_calls stream stream_options temperature top_p max_tokens max_completion_tokens stop seed n frequency_penalty presence_penalty logit_bias logprobs top_logprobs response_format reasoning_effort thinking user'.split(
+  'store model messages tools tool_choice parallel_tool_calls stream stream_options temperature top_p max_tokens max_completion_tokens stop seed n frequency_penalty presence_penalty logit_bias logprobs top_logprobs response_format reasoning_effort thinking user'.split(
     ' ',
   ),
 );

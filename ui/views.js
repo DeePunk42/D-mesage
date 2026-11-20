@@ -140,6 +140,11 @@ export function icon(name) {
   svg.setAttribute('viewBox', '0 0 24 24');
   svg.setAttribute('aria-hidden', 'true');
   const d = {
+    spinner: 'M12 4a8 8 0 1 1-8 8',
+    clock: 'M21 12a9 9 0 1 1-18 0 9 9 0 1 1 18 0Z M12 7v5l3 2',
+    cross: 'M6 6l12 12 M18 6 6 18',
+    check: 'M4 12l5 5L20 6',
+    unknown: 'M8 8a4 4 0 1 1 6 3.5c-1.5.8-2 1.5-2 3 M12 18.5v.5',
     undo: 'M4 9h9a6 6 0 0 1 0 12 M4 9l5-5 M4 9l5 5',
     redo: 'M20 9h-9a6 6 0 0 0 0 12 M20 9l-5-5 M20 9l-5 5',
     sliders: 'M3 7h8m4 0h6 M3 17h3m4 0h11 M11 4v6 M7 14v6',
@@ -147,8 +152,6 @@ export function icon(name) {
       'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m20 0v-2a4 4 0 0 0-3-4M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0Zm4-4a4 4 0 0 1 0 8',
     trash: 'M4 6h16 M9 6V3h6v3 M6 6l1 15h10l1-15 M10 10v7 M14 10v7',
     wrench: 'M14 6a5 5 0 0 0-6 6L3 17a2.2 2.2 0 0 0 3 3l6-6a5 5 0 0 0 6-6l-3 3-3-3 3-3Z',
-    pretty: 'm4 20 10-10 3 3L7 23z M16 3v4m-2-2h4 M6 4v6M3 7h6 M20 14v4m-2-2h4',
-    raw: 'm8 6-6 6 6 6m8-12 6 6-6 6m-3-15-2 18',
   };
   const p = document.createElementNS(ns, 'path');
   p.setAttribute('d', d[name]);
@@ -157,29 +160,9 @@ export function icon(name) {
 }
 export function textBlock(label, value, controls = []) {
   const block = el('section', '', 'contentText'),
-    head = sectionTitle(label);
-  const modes = el('span', '', 'viewModes'),
     view = el('div', '', 'contentView');
-  function display(raw) {
-    block.dataset.mode = raw ? 'raw' : 'pretty';
-    prettyButton.setAttribute('aria-pressed', !raw);
-    rawButton.setAttribute('aria-pressed', raw);
-    view.replaceChildren(raw ? el('pre', value, 'rawContent') : showText(value));
-  }
-  const prettyButton = button('', () => display(false)),
-    rawButton = button('', () => display(true));
-  for (const [b, name, label] of [
-    [prettyButton, 'pretty', 'Pretty'],
-    [rawButton, 'raw', 'Raw'],
-  ]) {
-    b.title = label;
-    b.setAttribute('aria-label', label);
-    b.append(icon(name));
-    modes.append(b);
-  }
-  head.append(modes, ...controls);
-  block.append(head, view);
-  display(false);
+  view.append(showText(value));
+  block.append(sectionTitle(label, controls), view);
   return block;
 }
 function toolNames(msg, lookup) {

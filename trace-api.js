@@ -2,12 +2,14 @@ import { validRequest } from './ui/protocols.js';
 import { isDeepStrictEqual } from 'node:util';
 import {
   storage,
+  checkLegacyOutcome,
   isReplayAgent,
   reconcile,
   recording,
   setRecording,
   captureCursor,
   captureChoices,
+  editCaptureChoices,
   captureScope,
   saveScope,
 } from './store.js';
@@ -15,20 +17,33 @@ import { z } from 'zod';
 import { launch } from './replay.js';
 
 const ids = z.array(z.string().trim().min(1)).transform((values) => [...new Set(values)].sort());
+const agentIds = ids.refine((a) => !a.some(isReplayAgent), 'Choose a client other than D-message.');
 export const scopeSchema = z.strictObject({
   agents: z.union([
     z.literal('all'),
-    ids.refine((a) => a.length > 0 && !a.some(isReplayAgent)),
+    agentIds.refine((a) => a.length > 0),
   ]),
 });
-export function recordState(action, scope) {
+const scopeEditSchema = z.strictObject({
+  agents: z.union([z.literal('all'), agentIds]),
+  add: agentIds.default([]),
+  remove: ids.default([]),
+});
+export function configureCaptureScope(input) {
+  const { agents, add, remove } = scopeEditSchema.parse(input);
+  if (remove.some((id) => add.includes(id) || (agents !== 'all' && agents.includes(id))))
+    throw Error('A removed agent cannot also be added or selected.');
+  return recordState('configure', { agents }, { add, remove });
+}
+export function recordState(action, scope, edits) {
   const db = storage();
   return db
     .transaction(() => {
       if (scope !== undefined) {
         if (action !== 'start' && action !== 'configure')
           throw Error('Only start and configure can change the capture scope.');
-        saveScope(db, scopeSchema.parse(scope));
+        if (edits) editCaptureChoices(db, edits.add, edits.remove);
+        saveScope(db, edits ? scope : scopeSchema.parse(scope));
       } else if (action === 'configure') throw Error('Provide a capture scope.');
       if (action === 'start' || action === 'stop') setRecording(action === 'start', db);
       return {
@@ -58,9 +73,10 @@ export function listTraces({ after = 0, session, limit = 25 }) {
 
 export function snapshot(ref) {
   const [kind, id] = ref.split(':');
+  if (kind === 'trace') checkLegacyOutcome(storage(), id);
   const queries = {
     trace:
-      'SELECT id AS call_id,session,agent,model,protocol,endpoint,started,ended,status,request,reply,NULL AS error FROM calls WHERE id=?',
+      "SELECT id AS call_id,session,agent,model,protocol,endpoint,started,ended,status,request,reply,json_extract(failure,'$.message') AS error,failure FROM calls WHERE id=?",
     draft: `SELECT c.id AS call_id,c.session,c.agent,json_extract(e.body,'$.model') AS model,c.protocol,c.endpoint,e.created AS started,NULL AS ended,'draft' AS status,e.body AS request,NULL AS reply,NULL AS error
       FROM experiments e JOIN calls c ON c.id=e.call_id WHERE e.id=?`,
     run: `SELECT c.id AS call_id,c.session,c.agent,coalesce(r.model,c.model) AS model,c.protocol,c.endpoint,r.started,r.ended,r.status,
@@ -69,6 +85,7 @@ export function snapshot(ref) {
   };
   const row = storage().query(queries[kind]).get(id);
   if (!row) throw Error('Snapshot not found: ' + ref);
+  if (row.failure) row.failure = JSON.parse(row.failure);
   return row;
 }
 

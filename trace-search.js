@@ -1,24 +1,24 @@
 import { Worker, parentPort, workerData } from 'node:worker_threads';
 import { Database } from 'bun:sqlite';
 import { searchConditions, rankedHits } from './ui/search.js';
-import { searchTurnBounds } from './session-tree.js';
+import { searchTurnBounds, sessionTree } from './session-tree.js';
 import { groupRows } from './list-groups.js';
 
-export function traceSearch(path) {
+export function traceSearch(path, kind = 'search') {
   let worker;
   let sequence = 0;
   const pending = new Map();
-  function stop() {
+  function stop(error = Error('Trace worker stopped.')) {
     worker?.terminate();
     worker = null;
-    for (const task of pending.values()) task.reject(Error('Trace search stopped.'));
+    for (const task of pending.values()) task.reject(error);
     pending.clear();
   }
   return {
     stop,
     find(options) {
       if (!worker) {
-        worker = new Worker(new URL(import.meta.url), { workerData: { path } });
+        worker = new Worker(new URL(import.meta.url), { workerData: { path, kind } });
         worker.on('error', stop);
         worker.on('message', ({ id, result, error }) => {
           const task = pending.get(id);
@@ -38,7 +38,9 @@ export function traceSearch(path) {
 }
 
 if (parentPort && workerData?.path) {
-  const db = new Database(workerData.path, { readonly: true });
+  const buildsTree = workerData.kind === 'tree';
+  const db = buildsTree ? new Database(workerData.path) : new Database(workerData.path, { readonly: true });
+  if (buildsTree) db.exec('PRAGMA busy_timeout=1500; PRAGMA foreign_keys=ON;');
   const capture = db.query('SELECT request,reply FROM calls WHERE id=?');
   const replay =
     db.query(`SELECT CASE WHEN r.kind='baseline' THEN c.request ELSE e.body END AS request,r.reply
@@ -46,6 +48,11 @@ if (parentPort && workerData?.path) {
   const cache = new Map();
   parentPort.on('message', ({ id, options }) => {
     try {
+      if (buildsTree) {
+        const result = sessionTree(options.agent, options.session, db, options);
+        parentPort.postMessage({ id, result });
+        return;
+      }
       const conditions = searchConditions(options.q);
       const cacheKey = JSON.stringify(conditions);
       if (!cache.has(cacheKey)) {

@@ -1,5 +1,6 @@
 import { storage } from './store.js';
 import { buildShape, requestChain } from './session-chain.js';
+import { activeBranch } from './ui/session-graph.js';
 
 export const CHAIN_VERSION = 3;
 
@@ -14,30 +15,28 @@ function readChain(blob) {
 }
 
 function storeChains(db, rows) {
+  const body = db.query('SELECT request FROM calls WHERE id=?');
   const save = db.query('INSERT OR REPLACE INTO call_chain(call_id,version,chain) VALUES(?,?,?)');
-  for (const row of rows) {
+  // Read one wire body at a time and hold only the compact chains for the write.
+  const chains = rows.map((row) => {
     let chain;
     try {
-      chain = requestChain(row.protocol, JSON.parse(row.request));
+      chain = requestChain(row.protocol, JSON.parse(body.get(row.id).request));
     } catch {
       chain = null;
     }
-    save.run(row.id, CHAIN_VERSION, new Uint8Array((chain ?? new BigUint64Array(0)).buffer));
-  }
-  return rows.length;
+    return [row.id, new Uint8Array((chain ?? new BigUint64Array(0)).buffer)];
+  });
+  db.transaction(() => {
+    for (const [id, chain] of chains) save.run(id, CHAIN_VERSION, chain);
+  }).immediate();
 }
 
 const missing = `FROM calls c LEFT JOIN call_chain k ON k.call_id=c.id
   WHERE c.session<>'' AND (k.version IS NULL OR k.version<>${CHAIN_VERSION})`;
 
-// Background backfill: a small batch per tick keeps the page service responsive.
-export function backfillChains(limit = 20, db = storage()) {
-  const rows = db.query(`SELECT c.id,c.protocol,c.request ${missing} LIMIT ?`).all(limit);
-  return rows.length ? db.transaction(() => storeChains(db, rows))() : 0;
-}
-
 // Search runs with a read-only database. Use the tree's prefix rule, including for
-// new captures whose background chain backfill has not reached them yet.
+// sessions whose chains have not been built by opening the tree yet.
 export function searchTurnBounds(db, agent, session) {
   const rows = db.query(`SELECT c.id,k.chain FROM calls c LEFT JOIN call_chain k
     ON k.call_id=c.id AND k.version=? WHERE c.agent=? AND c.session=? ORDER BY c.started,c.rowid`)
@@ -53,15 +52,16 @@ export function searchTurnBounds(db, agent, session) {
 
 const cache = new Map();
 
-export function sessionTree(agent, session, db = storage()) {
+const pageSize = 40;
+export function sessionTree(agent, session, db = storage(), options = {}) {
   if (!treeThread(agent, session)) throw Error('This request has no session ID.');
   const pending = db
-    .query(`SELECT c.id,c.protocol,c.request ${missing} AND c.agent=? AND c.session=?`)
+    .query(`SELECT c.id,c.protocol ${missing} AND c.agent=? AND c.session=?`)
     .all(agent, session);
-  if (pending.length) db.transaction(() => storeChains(db, pending))();
+  if (pending.length) storeChains(db, pending);
   const calls = db
     .query(
-      `SELECT c.id,c.rowid AS seq,c.started,c.ended,c.status,c.model,c.last_role,c.last_preview,c.final_preview
+      `SELECT c.id,c.rowid AS seq,c.started
        FROM calls c JOIN call_chain k ON k.call_id=c.id WHERE c.agent=? AND c.session=? ORDER BY c.started,c.rowid`,
     )
     .all(agent, session);
@@ -85,18 +85,50 @@ export function sessionTree(agent, session, db = storage()) {
     ...call,
     ...shape.nodes[i],
     parent: shape.nodes[i].parent == null ? null : calls[shape.nodes[i].parent].id,
+    parentSeq: shape.nodes[i].parent == null ? null : calls[shape.nodes[i].parent].seq,
   }));
-  const ids = new Set(nodes.map((n) => n.id));
-  if (ids.size) {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  if (byId.size) {
     const runs = db
       .query(
-        `SELECT r.id,r.rowid AS seq,e.call_id AS parent,r.started,r.ended,r.status,coalesce(r.model,c.model) AS model,
-          r.last_role,r.last_preview,r.final_preview FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id
+        `SELECT r.id,r.rowid AS seq,e.call_id AS parent,r.started
+         FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id
          WHERE c.agent=? AND c.session=? ORDER BY r.started,r.rowid`,
       )
       .all(agent, session);
-    for (const run of runs)
-      if (ids.has(run.parent)) nodes.push({ entry_type: 'repeater', kind: 'replay', ...run });
+    for (const run of runs) {
+      const parent = byId.get(run.parent);
+      if (!parent) continue;
+      const node = { entry_type: 'repeater', kind: 'replay', parentSeq: parent.seq, ...run };
+      nodes.push(node);
+      byId.set(node.id, node);
+    }
   }
-  return { agent, session, nodes };
+  const capture = db.query(`SELECT ended,status,model,last_role,last_preview,final_preview
+    FROM calls WHERE id=?`);
+  const replay = db.query(`SELECT r.ended,r.status,coalesce(r.model,c.model) AS model,
+    r.last_role,r.last_preview,r.final_preview FROM runs r JOIN experiments e ON e.id=r.experiment_id
+    JOIN calls c ON c.id=e.call_id WHERE r.id=?`);
+  const hydrate = (node) => ({
+    ...node,
+    ...(node.entry_type === 'capture' ? capture : replay).get(node.id),
+  });
+  if (options.focus) {
+    const node = byId.get(options.focus);
+    return { node: node ? hydrate(node) : null };
+  }
+  if (!options.paged) return { agent, session, nodes: nodes.map(hydrate) };
+
+  nodes.sort((a, b) => b.started - a.started ||
+    (a.entry_type === b.entry_type ? b.seq - a.seq : a.entry_type === 'repeater' ? -1 : 1));
+  const active = activeBranch(nodes);
+  const visible = options.activeOnly ? nodes.filter((node) => active.has(node.id)) : nodes;
+  const cursor = options.before ? visible.findIndex((node) => node.id === options.before) : -1;
+  const start = cursor + 1;
+  const page = visible.slice(start, start + pageSize);
+  return {
+    agent, session,
+    nodes: page.map((node) => ({ ...hydrate(node), active: active.has(node.id) })),
+    next: start + page.length < visible.length ? page.at(-1).id : null,
+  };
 }

@@ -6,8 +6,10 @@ import { launch } from './replay.js';
 function setSetting(db, key, value) {
   db.query('INSERT OR REPLACE INTO settings VALUES(?,?)').run(key, value);
 }
-function workspace(db) {
+function workspace(db, defer = false) {
   const setting = (key) => db.query('SELECT value FROM settings WHERE key=?').get(key)?.value;
+  const view = setting('repeater_view') || 'trace';
+  if (defer && view !== 'repeater') return { view, deferred: true };
   const tabs = db.query('SELECT id,name,source_ref,closed FROM repeater_tabs ORDER BY rowid').all();
   const active = setting('repeater_active');
   const id =
@@ -17,23 +19,26 @@ function workspace(db) {
     id &&
     db
       .query(
-        `SELECT t.*, c.protocol,c.endpoint,coalesce(r.model,c.model) AS original_model
+        `SELECT t.*, c.agent,c.protocol,c.endpoint,coalesce(r.model,c.model) AS original_model
          FROM repeater_tabs t JOIN calls c ON c.id=t.call_id
          LEFT JOIN runs r ON t.source_ref LIKE 'run:%' AND r.id=substr(t.source_ref,5) WHERE t.id=?`,
       )
       .get(id);
-  if (tab) tab.state = JSON.parse(tab.state);
-  return { tabs, tab: tab || null, view: setting('repeater_view') || 'trace' };
+  if (tab) {
+    tab.state = JSON.parse(tab.state);
+    tab.run_view = JSON.parse(tab.run_view);
+  }
+  return { tabs, tab: tab || null, view };
 }
 function selectTab(db, id) {
   setSetting(db, 'repeater_active', id);
   setSetting(db, 'repeater_view', 'repeater');
 }
-function insertTab(db, callId, ref, name, state) {
+function insertTab(db, callId, ref, name, state, runView = null) {
   const id = crypto.randomUUID();
   db.query(
-    'INSERT INTO repeater_tabs(id,call_id,source_ref,name,state,revision) VALUES(?,?,?,?,?,?)',
-  ).run(id, callId, ref, name, state, crypto.randomUUID());
+    'INSERT INTO repeater_tabs(id,call_id,source_ref,name,state,revision,run_view) VALUES(?,?,?,?,?,?,?)',
+  ).run(id, callId, ref, name, state, crypto.randomUUID(), runView);
   selectTab(db, id);
 }
 function openSource(db, ref) {
@@ -71,7 +76,6 @@ function openSource(db, ref) {
       tab: 'Messages',
       field: null,
       dirty: false,
-      rTab: 'Answer',
     }),
   );
 }
@@ -115,14 +119,23 @@ function checkState(state, protocol) {
         typeof state.field.text !== 'string' ||
         typeof state.field.error !== 'string' ||
         (state.field.prettySource != null && typeof state.field.prettySource !== 'string'))) ||
-    !['Answer', 'Response JSON', 'Request snapshot', 'Changes'].includes(state.rTab) ||
+    (state.rTab !== undefined && !['Answer', 'Response JSON', 'Request snapshot', 'Changes'].includes(state.rTab)) ||
     !['Messages', 'Full JSON', 'Changes'].includes(state.tab)
   )
     throw Error('Invalid tab state.');
 }
 export function tabRequest(action, args, upstream) {
   const db = storage();
-  if (action === 'workspace') return db.transaction(() => workspace(db))();
+  if (action === 'workspace') return db.transaction(() => workspace(db, args.defer))();
+  if (action === 'run-view') {
+    if (!['Reply', 'Request snapshot'].includes(args.tab) || typeof args.raw !== 'boolean')
+      throw Error('Invalid run view.');
+    const view = JSON.stringify({ tab: args.tab, raw: args.raw });
+    const result = db.query('UPDATE repeater_tabs SET run_view=? WHERE id=? AND closed IS NULL')
+      .run(view, args.id);
+    if (!result.changes) throw Error('Tab is no longer open.');
+    return {};
+  }
   if (action === 'runs') {
     reconcile();
     const runs = db
@@ -189,7 +202,7 @@ export function tabRequest(action, args, upstream) {
           case 'duplicate': {
             const state = args.state ?? JSON.parse(tab.state);
             checkState(state, tab.protocol);
-            insertTab(db, tab.call_id, tab.source_ref, tab.name + ' copy', JSON.stringify(state));
+            insertTab(db, tab.call_id, tab.source_ref, tab.name + ' copy', JSON.stringify(state), tab.run_view);
             break;
           }
           case 'rename': {

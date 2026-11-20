@@ -1,3 +1,4 @@
+import { continuePicker } from './continue-picker.js';
 import { toolLookup, phaseLabel } from './response-items.js';
 import {
   protocolNames,
@@ -9,6 +10,7 @@ import {
   removeEntry,
   insertEntry,
 } from './protocols.js';
+import { requestHistory } from './history-page.js';
 import { messagePreview, pairingWarning, prettyEditorText } from './messages.js';
 import {
   el,
@@ -72,6 +74,9 @@ const time = (t) => new Date(t).toLocaleTimeString('en', { hour12: false });
 const statusName = {
   complete: 'Complete',
   pending: 'Pending',
+  checking: 'Checking outcome…',
+  checking_unknown: 'Checking outcome…',
+  unconfirmed: 'Completion unconfirmed',
   incomplete: 'Incomplete',
   queued: 'Queued',
   running: 'Running',
@@ -97,7 +102,7 @@ const invoke =
       explain(e);
     }
   };
-async function api(path, body, keepalive = false) {
+async function api(path, body, keepalive = false, signal) {
   const payload = body === undefined ? undefined : JSON.stringify(body);
   const res = await fetch(new URL('api/' + path, location.href), {
     method: body === undefined ? 'GET' : 'POST',
@@ -107,10 +112,17 @@ async function api(path, body, keepalive = false) {
     },
     body: payload,
     keepalive: keepalive && new Blob([payload]).size < 60000,
+    signal,
   });
   const data = await res.json();
   if (!res.ok) throw Error(data.error || 'Request failed');
   return data;
+}
+let preferenceWrites = Promise.resolve();
+function saveViewPreference(preference, path = 'view-preferences') {
+  preferenceWrites = preferenceWrites
+    .then(() => api(path, preference, true))
+    .catch(explain);
 }
 let workspace = 'trace',
   selected = null,
@@ -118,9 +130,8 @@ let workspace = 'trace',
   draft = null,
   dirty = false,
   posting = false;
-let hTab = 'Messages',
-  dTab = 'Messages',
-  rTab = 'Answer',
+let dTab = 'Messages',
+  runView = { tab: 'Reply', raw: false },
   runId = 'original',
   snapshot = null,
   runs = [],
@@ -142,6 +153,29 @@ let undoStack = [],
 let field = null,
   typing = false;
 const tabUndo = new Map();
+const tabPositions = new Map();
+let beforeChanges = 'Messages';
+function rememberPosition() {
+  if (!source || workspace !== 'repeater') return;
+  const editor = $('draftView').querySelector('.inlineSource');
+  tabPositions.set(source.id, {
+    scroll: $('draftView').scrollTop,
+    field: field?.key,
+    caret: editor && [editor.selectionStart, editor.selectionEnd, editor.selectionDirection],
+    editorScroll: editor?.scrollTop,
+  });
+}
+function restorePosition() {
+  const position = tabPositions.get(source?.id);
+  if (position?.caret && position.field === field?.key) {
+    const editor = $('draftView').querySelector('.inlineSource');
+    if (editor) {
+      editor.setSelectionRange(...position.caret);
+      editor.scrollTop = position.editorScroll;
+    }
+  }
+  $('draftView').scrollTop = position?.scroll ?? 0;
+}
 let writer = null,
   switching = false,
   restoring = false;
@@ -209,25 +243,125 @@ function stepHistory(from, to) {
 $('undo').onclick = () => stepHistory(undoStack, redoStack);
 $('redo').onclick = () => stepHistory(redoStack, undoStack);
 let viewWrite = Promise.resolve();
+let repeaterLoaded = false;
 function setWorkspace(tab, remember = false) {
+  const changed = tab !== workspace;
+  if (changed && workspace === 'repeater') rememberPosition();
   if (remember && tab !== workspace)
     viewWrite = viewWrite.then(() => api('tabs/view', { view: tab })).catch(explain);
   workspace = tab;
-  for (const id of ['scopeMenu', 'filterMenu', 'metaMenu', 'tabMenu', 'modelMenu']) $(id).open = false;
+  for (const id of ['scopeMenu', 'filterMenu', 'metaMenu', 'tabMenu', 'modelMenu', 'runMenu', 'continueMenu']) $(id).open = false;
   $('settings').hidden = tab !== 'settings';
   $('toSettings').setAttribute('aria-pressed', tab === 'settings');
   $('mcpHint').textContent = '';
   $('mcpToken').hidden = true;
   $('mcpToken').value = '';
   $('mcpReveal').textContent = 'Show token';
+  $('mcpReveal').setAttribute('aria-expanded', 'false');
   $('trace').hidden = tab !== 'trace';
   $('repeat').hidden = tab !== 'repeater';
   $('toTrace').setAttribute('aria-pressed', tab === 'trace');
   $('toRepeat').setAttribute('aria-pressed', tab === 'repeater');
   $('noDraft').hidden = !!draft;
   $('studio').hidden = !draft;
+  if (changed) {
+    if (tab === 'trace' && activeGroup) paintTree();
+    else discardOlderPage();
+  }
 }
+function dshFeedback(text) {
+  $('dshFeedback').textContent = text;
+  $('dshFeedback').hidden = !text;
+}
+function paintDsh(config) {
+  const saved = !!config.origin;
+  if ('overrideOrigin' in config) $('dshUrl').value = config.overrideOrigin;
+  $('dshUrl').placeholder = config.detectedOrigin || config.origin || 'Auto-detect local desktop';
+  $('dshStatus').dataset.state = config.connected ? 'on' : 'off';
+  $('dshStatus').textContent = config.connected ? 'Connected' : saved ? 'Disconnected' : 'Not connected';
+  $('dshCookie').placeholder = saved ? 'Saved credential · enter a replacement' : 'Launch URL, token, or cookie';
+  $('dshConnect').textContent = saved ? 'Update' : 'Connect';
+  $('dshDisconnect').hidden = !saved;
+  dshFeedback(config.error || '');
+}
+$('dshHelpToggle').onclick = () => {
+  const help = $('dshGrantHelp');
+  help.hidden = !help.hidden;
+  $('dshHelpToggle').setAttribute('aria-expanded', String(!help.hidden));
+};
+$('dshForm').onsubmit = invoke(async (event) => {
+  event.preventDefault();
+  $('dshConnect').disabled = true;
+  $('dshDisconnect').disabled = true;
+  try {
+    paintDsh(await api('settings/dsh', { url: $('dshUrl').value.trim(), credential: $('dshCookie').value.trim() }));
+    $('dshCookie').value = '';
+    await refreshContinuations();
+  } catch (error) {
+    dshFeedback(error.message);
+  } finally {
+    $('dshConnect').disabled = $('dshDisconnect').disabled = false;
+  }
+});
+$('dshDisconnect').onclick = invoke(async () => {
+  paintDsh(await api('settings/dsh', { disconnect: true }));
+  $('dshCookie').value = $('dshUrl').value = '';
+  await refreshContinuations();
+});
+function paintReplayAgents(agents) {
+  const container = $('nativeReplaySettings');
+  for (const agent of agents) {
+    let card = document.getElementById('replay-settings-' + agent.id);
+    if (!card) {
+      card = el('details', '', 'replayAgent nativeAgent');
+      card.id = 'replay-settings-' + agent.id;
+      const summary = el('summary', '', 'agentHeading');
+      const status = el('small', '', 'connectionState');
+      summary.append(agentIcon(agent.id), el('span', agentName(agent.id), 'agentTitle'), status);
+      const form = el('form', '', 'agentFields');
+      const path = el('input');
+      path.id = 'replay-path-' + agent.id;
+      path.spellcheck = false;
+      const label = el('label', 'Executable path', 'agentLabel');
+      label.htmlFor = path.id;
+      const row = el('div', '', 'agentInputRow');
+      const save = el('button', 'Save');
+      save.type = 'submit';
+      row.append(path, save);
+      form.append(label, row);
+      form.onsubmit = invoke(async event => {
+        event.preventDefault();
+        save.disabled = true;
+        try {
+          paintReplayAgents([await api('settings/replay', { id: agent.id, path: path.value.trim() })]);
+          await refreshContinuations();
+        } finally { save.disabled = false; }
+      });
+      card.append(summary, form);
+      container.append(card);
+    }
+    const status = card.querySelector('small');
+    status.dataset.state = agent.available ? 'on' : 'off';
+    status.textContent = agent.available ? 'CLI available' : 'CLI unavailable';
+    const input = card.querySelector('input');
+    input.value = agent.path;
+    input.placeholder = agent.detected || 'Auto-detect executable';
+  }
+}
+async function loadSettings() {
+  const [mcp, dsh, agents] = await Promise.all([api('settings/mcp'), api('settings/dsh'), api('settings/replay')]);
+  paintMcp(mcp);
+  paintDsh(dsh);
+  paintReplayAgents(agents);
+}
+let savedListener;
+function updateListenerAction() {
+  $('mcpApply').hidden = !savedListener ||
+    ($('mcpEnabled').checked === savedListener.enabled && $('mcpPort').value === String(savedListener.port));
+}
+$('mcpForm').oninput = updateListenerAction;
 function paintMcp(config) {
+  savedListener = config;
   $('mcpEnabled').checked = config.enabled;
   $('mcpPort').value = config.port;
   $('mcpUrl').value = config.url;
@@ -235,10 +369,11 @@ function paintMcp(config) {
   $('mcpStatus').textContent =
     config.error || (config.listening ? 'Listening on 127.0.0.1' : 'Listener off');
   $('mcpCopy').disabled = !config.listening;
+  updateListenerAction();
 }
 $('toSettings').onclick = invoke(async () => {
   setWorkspace('settings', true);
-  paintMcp(await api('settings/mcp'));
+  await loadSettings();
 });
 $('mcpForm').onsubmit = invoke(async (e) => {
   e.preventDefault();
@@ -265,10 +400,12 @@ $('mcpReveal').onclick = invoke(async () => {
     input.hidden = false;
     input.select();
     $('mcpReveal').textContent = 'Hide token';
+    $('mcpReveal').setAttribute('aria-expanded', 'true');
   } else {
     input.value = '';
     input.hidden = true;
     $('mcpReveal').textContent = 'Show token';
+    $('mcpReveal').setAttribute('aria-expanded', 'false');
   }
 });
 $('mcpCopy').onclick = invoke(async () => {
@@ -297,6 +434,14 @@ function tabs(id, values, current, select) {
       return b;
     }),
   );
+}
+function formatToggle(id, label, available, raw, toggle) {
+  const control = $(id);
+  control.hidden = !available;
+  control.title = raw ? `Show parsed ${label}` : `Show raw ${label}`;
+  control.setAttribute('aria-label', control.title);
+  control.setAttribute('aria-pressed', String(raw));
+  control.onclick = toggle;
 }
 function confirmAction(msg, label, destructive = false) {
   const dlg = $('confirmDialog');
@@ -358,15 +503,103 @@ let activeHits = [],
   hitIndex = 0,
   hitRecord = '',
   hitQuery = '';
+const sessionViews = new Map();
+const defaultTraceView = { tab: 'Request', requestRaw: false, replyRaw: false };
+let traceView = defaultTraceView;
+let followingHit = false;
+let selectionController, inspectEpoch = 0;
+const detailParts = new WeakMap();
+function preferredTraceView(record) {
+  if (!record.session) return defaultTraceView;
+  const group = sessionRowId(record.agent, record.session);
+  return sessionViews.get(group) ?? { ...defaultTraceView, ...record.detail_view };
+}
+function chooseTraceView(change) {
+  const previous = traceView;
+  traceView = { ...previous, ...change };
+  followingHit = false;
+  if (selected.session && Object.keys(change).some((key) => previous[key] !== change[key])) {
+    sessionViews.set(sessionRowId(selected.agent, selected.session), traceView);
+    saveViewPreference({ record: selected.id, ...traceView });
+  }
+  inspect(true);
+}
 function focusHit(index) {
   hitIndex = index;
-  hTab = activeHits[index].side === 'request' ? 'Full JSON' : 'Response';
+  followingHit = true;
   inspect();
+}
+const detailFields = { request: 'body', reply: 'response', history: 'historyPage' };
+async function loadHistoryPage(record, before) {
+  if (Object.hasOwn(record, 'body')) {
+    record.historySource ??= requestHistory(record.protocol, record.body);
+    return record.historySource(before);
+  }
+  return loadEvent(record.id, record.entry_type, 'history', record.signal, before);
+}
+function loadDetailPart(record, part) {
+  if (Object.hasOwn(record, detailFields[part])) return Promise.resolve();
+  if (!detailParts.has(record)) detailParts.set(record, {});
+  const pending = detailParts.get(record);
+  if (part === 'history')
+    return (pending.history ??= loadHistoryPage(record).then((page) => {
+      record.historyPage = page;
+    }).finally(() => delete pending.history));
+  return (pending[part] ??= loadEvent(record.id, record.entry_type, part, record.signal).then((data) => {
+    if (part === 'request') record.body = JSON.parse(data.request);
+    else {
+      record.response = JSON.parse(data.reply);
+      record.error = data.error;
+      record.failure = data.failure;
+      record.recovered_output = data.recovered_output;
+    }
+  }).finally(() => delete pending[part]));
+}
+function prefetchDetails(record, part) {
+  if (record.prefetching) return;
+  record.prefetching = true;
+  // Yield a paint before reading and parsing the other payload.
+  requestAnimationFrame(() => setTimeout(async () => {
+    if (record !== selected || record.signal.aborted || workspace !== 'trace') {
+      record.prefetching = false;
+      return;
+    }
+    try {
+      await Promise.all(['request', 'reply'].filter((side) => side !== part)
+        .map((side) => loadDetailPart(record, side)));
+    } catch {
+      // Opening that tab can retry a failed speculative request.
+      record.prefetching = false;
+      return;
+    }
+    if (record !== selected || record.signal.aborted || !record.searchHit) return;
+    const focused = activeHits[hitIndex];
+    const hits = searchConditions(hitQuery).flatMap((query) =>
+      [...rankedHits(record.body, record.response, query, record.searchHit.kept)]);
+    const index = focused && hits.findIndex((hit) =>
+      hit.side === focused.side && hit.term === focused.term &&
+      pointer(hit.path) === pointer(focused.path) && hit.start === focused.start);
+    if (hits.length) {
+      activeHits = hits;
+      hitIndex = Math.max(0, index || 0);
+      if (followingHit) updateHitBar(activeHits[hitIndex]);
+    }
+  }, 0));
+}
+function updateHitBar(hit) {
+  $('hitBar').hidden = !hit;
+  if (!hit) return;
+  $('hitPath').textContent = hit.side + ' ' + pointer(hit.path);
+  $('hitCount').textContent = hitIndex + 1 + ' / ' + activeHits.length;
+  $('hitPrev').disabled = hitIndex === 0;
+  $('hitNext').disabled = hitIndex === activeHits.length - 1;
 }
 $('hitPrev').onclick = () => focusHit(hitIndex - 1);
 $('hitNext').onclick = () => focusHit(hitIndex + 1);
 function inspect(scroll = false) {
   if (!selected) return;
+  const record = selected;
+  const epoch = ++inspectEpoch;
   $('emptyInspect').hidden = true;
   $('inspector').hidden = false;
   $('callTitle').textContent =
@@ -390,46 +623,140 @@ function inspect(scroll = false) {
   $('callMeta').replaceChildren(
     ...facts.filter(([, v]) => v).flatMap(([k, v]) => [el('dt', k), el('dd', v)]),
   );
-  const views = selected.session
-    ? ['This turn', 'Messages', 'Full JSON', 'Response']
-    : ['Messages', 'Full JSON', 'Response'];
-  if (!views.includes(hTab)) hTab = 'Messages';
-  tabs('histTabs', views, hTab, (v) => {
-    hTab = v;
-    inspect(true);
-  });
+  const hit = followingHit ? activeHits[hitIndex] : null;
+  const tab = hit ? (hit.side === 'request' ? 'Request' : 'Reply') : traceView.tab;
+  const part = tab.toLowerCase();
+  const request = tab === 'Request';
+  const mode = request ? 'requestRaw' : 'replyRaw';
+  const raw = !!hit || traceView[mode];
+  tabs('histTabs', ['Request', 'Reply', 'History'], tab, (tab) => chooseTraceView({ tab }));
+  formatToggle(
+    'traceFormat',
+    request ? 'request' : 'reply',
+    request || (tab === 'Reply' && hasRawReply(selected)),
+    raw,
+    () => chooseTraceView({ tab, [mode]: !raw }),
+  );
   const box = $('inspectView');
+  detachHistory(box);
   box.replaceChildren();
-  const hit = activeHits[hitIndex];
-  const focused = hit && (hit.side === 'request' ? hTab === 'Full JSON' : hTab === 'Response');
-  $('hitBar').hidden = !focused;
-  if (focused) {
-    $('hitPath').textContent = hit.side + ' ' + pointer(hit.path);
-    $('hitCount').textContent = hitIndex + 1 + ' / ' + activeHits.length;
-    $('hitPrev').disabled = hitIndex === 0;
-    $('hitNext').disabled = hitIndex === activeHits.length - 1;
-    box.append(
-      jsonPanel(hit.side === 'request' ? selected.body : selected.response, null, {
-        ...hit,
-      }),
-    );
+  if (scroll) box.scrollTop = 0;
+  updateHitBar(hit);
+  if (!Object.hasOwn(record, detailFields[part])) {
+    box.append(el('p', `Loading ${tab.toLowerCase()}…`, 'hint'));
+    void loadDetailPart(record, part).then(() => {
+      if (record === selected && epoch === inspectEpoch && !record.signal.aborted) inspect(scroll);
+    }).catch((error) => {
+      if (record === selected && epoch === inspectEpoch && !record.signal.aborted) {
+        box.replaceChildren(el('p', error.message, 'hint'));
+      }
+    });
+    return;
+  }
+  if (request && raw) box.append(jsonPanel(selected.body, null, hit));
+  else if (request && selected.session) {
+    if (!renderTurn(box)) return;
+  }
+  else if (tab === 'Reply') box.append(replyContent(selected, raw, list, hit));
+  else if (tab === 'History') renderHistory(box, record);
+  else renderRequestMessages(box);
+  if (hit)
     requestAnimationFrame(() =>
       box.querySelector('.searchTarget mark')?.scrollIntoView({ block: 'nearest' }),
     );
-  } else if (hTab === 'Full JSON') box.append(jsonPanel(selected.body));
-  else if (hTab === 'This turn') renderTurn(box);
-  else if (hTab === 'Response') {
-    if (selected.response != null)
-      box.append(responseContent(selected.response, selected.protocol, true));
-    else box.append(noReply());
-    if (scroll) box.scrollTop = 0;
-  } else {
-    const msgs = requestEntries(selected.protocol, selected.body).map((entry) => entry.message);
-    const lookup = toolLookup(msgs);
-    msgs.forEach((m, i) => box.append(messageCard(m, i, i === msgs.length - 1, null, lookup)));
-    if (scroll && box.lastElementChild)
-      box.scrollTop = box.lastElementChild.offsetTop - box.offsetTop;
+  prefetchDetails(record, part);
+}
+function renderRequestMessages(box) {
+  const messages = requestEntries(selected.protocol, selected.body).map((entry) => entry.message);
+  const lookup = toolLookup(messages);
+  messages.forEach((message, i) =>
+    box.append(messageCard(message, i, i === messages.length - 1, null, lookup)),
+  );
+}
+let visibleHistory;
+const historyObserver = new IntersectionObserver((entries) => {
+  const view = visibleHistory;
+  const entry = entries.findLast(({ target }) => target === view?.edge);
+  if (!entry) return;
+  view.near = entry.isIntersecting;
+  revealHistoryPage(view);
+}, { root: $('inspectView'), rootMargin: '320px 0px 0px' });
+
+function detachHistory(box) {
+  if (!visibleHistory) return;
+  visibleHistory.scroll = box.scrollTop;
+  historyObserver.disconnect();
+  visibleHistory = null;
+}
+function historyCards(page, openLast = false) {
+  const lookup = toolLookup(page.messages);
+  for (const [id, call] of page.linked) lookup.set(id, call);
+  const cards = document.createDocumentFragment();
+  page.messages.forEach((message, i) => {
+    cards.append(messageCard(message, page.start + i, openLast && i === page.messages.length - 1, null, lookup));
+  });
+  return cards;
+}
+function watchHistoryEdge(view) {
+  historyObserver.disconnect();
+  view.near = false;
+  if (view.next == null) view.edge.remove();
+  else {
+    historyObserver.observe(view.edge);
+    requestAnimationFrame(() => setTimeout(() => prefetchHistoryPage(view), 0));
   }
+}
+function renderHistory(box, record) {
+  if (!record.historyView) {
+    const list = el('div');
+    const edge = el('div', '', 'treeEdge');
+    edge.setAttribute('role', 'status');
+    list.append(edge, historyCards(record.historyPage, true));
+    record.historyView = { list, edge, next: record.historyPage.next };
+  }
+  const view = record.historyView;
+  view.record = record;
+  visibleHistory = view;
+  box.append(view.list);
+  box.scrollTop = view.scroll ?? box.scrollHeight;
+  watchHistoryEdge(view);
+}
+async function prefetchHistoryPage(view) {
+  if (visibleHistory !== view || workspace !== 'trace' || view.loading || view.staged ||
+      view.next == null || view.record.signal.aborted) return;
+  const record = view.record;
+  view.loading = true;
+  view.error = false;
+  revealHistoryPage(view);
+  try {
+    view.staged = await loadHistoryPage(record, view.next);
+  } catch {
+    view.error = !record.signal.aborted;
+  } finally {
+    view.loading = false;
+  }
+  if (record.signal.aborted && view.record !== record) await prefetchHistoryPage(view);
+  else revealHistoryPage(view);
+}
+function revealHistoryPage(view) {
+  if (visibleHistory !== view || workspace !== 'trace' || !view.near || view.record.signal.aborted) return;
+  if (view.error) {
+    view.edge.replaceChildren(button('Retry loading earlier messages', () => prefetchHistoryPage(view)));
+    return;
+  }
+  if (!view.staged) {
+    view.edge.textContent = 'Loading…';
+    return;
+  }
+  const box = $('inspectView');
+  const anchor = view.edge.nextElementSibling;
+  const top = anchor?.getBoundingClientRect().top;
+  view.edge.textContent = '';
+  view.edge.after(historyCards(view.staged));
+  view.next = view.staged.next;
+  view.staged = null;
+  if (anchor) box.scrollTop += anchor.getBoundingClientRect().top - top;
+  watchHistoryEdge(view);
 }
 function queuedMessage(id, refresh) {
   const box = el('div', '', 'hint');
@@ -448,21 +775,25 @@ function queuedMessage(id, refresh) {
   );
   return box;
 }
-function noReply() {
-  if (selected.status === 'queued') return queuedMessage(selected.id, list);
+function noReply(record, refresh) {
+  if (record.status === 'queued') return queuedMessage(record.id, refresh);
   return el(
     'p',
-    selected.error ||
+    record.error ||
       {
         canceled: 'Canceled before sending.',
         pending: 'Waiting for a response…',
+        checking: 'Checking the Magpie request ledger…',
+        checking_unknown: 'Checking the Magpie request ledger…',
+        complete: 'Response not captured.',
         running: 'Waiting for a response…',
+        draft: 'This draft has not been sent.',
         incomplete:
-          selected.entry_type === 'capture' && selected.ended == null
+          record.entry_type === 'capture' && record.ended == null
             ? 'The capture ended without a completion callback. The model outcome is unknown.'
             : 'No complete response was captured.',
         failed: 'The request failed before a response was saved.',
-      }[selected.status] ||
+      }[record.status] ||
       'No response body was saved.',
     'hint',
   );
@@ -475,7 +806,7 @@ const kindLabel = { retry: 'Retry', compacted: 'Possible compaction', branch: 'B
 const nodeRef = (n) => (n ? (n.entry_type === 'repeater' ? 'R' : '#') + n.seq : '');
 function describeNode(n, byId) {
   const p = byId.get(n.parent),
-    ref = nodeRef(p);
+    ref = nodeRef(p) || (n.parentSeq == null ? '' : '#' + n.parentSeq);
   const kept = p ? `kept ${n.kept} of ${p.items} items · +${n.added}` : '';
   return {
     root: n.main ? `Session start · ${n.items} items` : `Separate conversation · ${n.items} items`,
@@ -489,26 +820,100 @@ function describeNode(n, byId) {
 function treeSignature(g) {
   return [g.requests, g.replays, g.queued, g.running, g.settled, g.previewed, g.activitySeq, g.last, g.latest.status, g.latest.ended].join('|');
 }
+function fetchTreePage(agent, session, active, before, signal) {
+  const query = new URLSearchParams({ agent: agent ?? '', session, page: '1', active: active ? '1' : '0' });
+  if (before) query.set('before', before);
+  return api('sessions/tree?' + query, undefined, false, signal);
+}
 async function ensureTree(id, agent, session, sig) {
+  const active = activeOnly;
   const cached = trees.get(id);
-  if (cached && (cached.sig === sig || cached.loading)) return;
-  trees.set(id, { ...cached, sig, loading: true });
+  const sameView = cached?.active === active;
+  if (sameView && (cached.loading || (cached.sig === sig && !cached.error))) return;
+  const loading = { ...(sameView ? cached : {}), sig, active, loading: true, error: false };
+  trees.set(id, loading);
   try {
-    const data = await api('sessions/tree?' + new URLSearchParams({ agent: agent ?? '', session }));
-    trees.set(id, { sig, nodes: data.nodes, byId: new Map(data.nodes.map((n) => [n.id, n])) });
+    const data = await fetchTreePage(agent, session, active);
+    if (trees.get(id) !== loading) return;
+    const keepPages = sameView && data.nodes.some((node) => cached.byId?.has(node.id));
+    const saved = keepPages ? cached.byId : null;
+    const byId = new Map([...(saved ?? []), ...data.nodes.map((n) => [n.id, n])]);
+    const paged = !!(keepPages && cached.paged);
+    trees.set(id, {
+      sig, active, nodes: [...byId.values()], byId, next: paged ? cached.next : data.next, paged,
+    });
   } catch (error) {
-    trees.delete(id);
+    if (trees.get(id) === loading) {
+      trees.set(id, { ...loading, loading: false, error: true });
+      if (activeGroup?.id === id) paintTree();
+    }
     throw error;
   }
   if (activeGroup?.id === id) paintTree();
+  if (selected?.signal.aborted) return;
   const node = trees.get(id).byId.get(selected?.id);
   if (node && (node.status !== selected.status || node.ended !== selected.ended)) {
-    const c = await loadEvent(node.id, node.entry_type);
-    if (c.id === selected?.id) {
-      selected = parseCall(c);
-      inspect();
-    }
-  } else if (node && hTab === 'This turn') inspect();
+    await select(node.id, false, false, node, true);
+  } else if (selected?.session && sessionRowId(selected.agent, selected.session) === id &&
+      !followingHit && traceView.tab === 'Request' && !traceView.requestRaw) inspect();
+}
+let olderPage;
+const treeEdgeObserver = new IntersectionObserver((entries) => {
+  const entry = entries.findLast(({ target }) => target === olderPage?.edge);
+  if (!entry) return;
+  olderPage.near = entry.isIntersecting;
+  revealOlderPage();
+}, { root: $('treeRows'), rootMargin: '320px 0px' });
+
+function discardOlderPage() {
+  treeEdgeObserver.disconnect();
+  olderPage?.controller.abort();
+  olderPage = null;
+}
+async function prefetchOlderPage(page) {
+  if (page !== olderPage) return;
+  page.error = false;
+  revealOlderPage();
+  try {
+    const { agent, session } = activeGroup;
+    page.result = await fetchTreePage(agent, session, page.active, page.cursor, page.controller.signal);
+  } catch {
+    page.error = true;
+  }
+  if (page === olderPage) revealOlderPage();
+}
+function revealOlderPage() {
+  const page = olderPage;
+  if (!page?.near || workspace !== 'trace' || activeGroup?.id !== page.id) return;
+  const tree = trees.get(page.id);
+  if (tree?.loading || tree?.next !== page.cursor || tree.active !== page.active) return;
+  if (page.error) {
+    page.edge.replaceChildren(button('Retry loading older requests', () => prefetchOlderPage(page)));
+    return;
+  }
+  if (!page.result) {
+    page.edge.textContent = 'Loading…';
+    return;
+  }
+  const { nodes, next } = page.result;
+  discardOlderPage();
+  for (const node of nodes) tree.byId.set(node.id, node);
+  tree.nodes = [...tree.byId.values()];
+  tree.next = next === page.cursor ? null : next;
+  tree.paged = true;
+  paintTree();
+}
+function watchTreeEdge(group, tree, edge) {
+  if (workspace !== 'trace' || !edge) return discardOlderPage();
+  if (olderPage?.id !== group.id || olderPage.cursor !== tree.next || olderPage.active !== tree.active) {
+    discardOlderPage();
+    const page = { id: group.id, cursor: tree.next, active: tree.active, controller: new AbortController() };
+    olderPage = page;
+    requestAnimationFrame(() => setTimeout(() => prefetchOlderPage(page), 0));
+  }
+  olderPage.edge = edge;
+  olderPage.near = false;
+  treeEdgeObserver.observe(edge);
 }
 function treeEntry(id) {
   for (const [gid, tree] of trees) {
@@ -521,6 +926,11 @@ function treeEntry(id) {
       };
   }
 }
+const traceStatusIcons = {
+  pending: 'spinner', running: 'spinner', checking: 'spinner', checking_unknown: 'spinner',
+  queued: 'clock', failed: 'cross', interrupted: 'cross', canceled: 'cross', incomplete: 'cross',
+  unconfirmed: 'unknown',
+};
 function previewLine(r, hit) {
   const line = el('span', '', 'eventPreview');
   if (hit) {
@@ -530,14 +940,23 @@ function previewLine(r, hit) {
     line.append(roleBadge(r.last_role));
     if (r.last_role === 'tool') line.append(icon('wrench'));
     line.append(el('span', r.last_preview || '—', 'snippet'));
-    if (r.final_preview != null) {
-      line.append(el('small', 'Final answer', 'phaseBadge'));
-      if (r.final_preview) line.append(el('span', r.final_preview, 'snippet'));
-    }
+    if (r.final_preview) line.append(el('span', r.final_preview, 'snippet'));
     line.title = [r.last_preview, r.final_preview].filter(Boolean).join(' · ');
   }
-  if (r.status !== 'complete')
-    line.append(el('small', traceStatus(r), 'eventStatus ' + r.status));
+  const finalAnswer = r.status === 'complete' && r.final_preview != null;
+  if (finalAnswer || (r.status && r.status !== 'complete')) {
+    const label = finalAnswer ? 'Final answer' : traceStatus(r);
+    const name = finalAnswer ? 'check' : label === statusName.unconfirmed ? 'unknown' : traceStatusIcons[r.status];
+    const badge = el('small', name ? '' : label, 'eventStatus');
+    badge.title = label;
+    if (name) {
+      badge.classList.add('status-' + name);
+      badge.setAttribute('role', 'img');
+      badge.setAttribute('aria-label', label);
+      badge.append(icon(name));
+    }
+    line.append(badge);
+  }
   return line;
 }
 function flatRow(r) {
@@ -567,7 +986,7 @@ async function activateSession(g) {
   paintRows();
   paintTree();
   await select(g.latest.id);
-  $('trace').classList.add('showDetail');
+  if (activeGroup?.id === g.id) $('trace').classList.add('showDetail');
 }
 function sessionRow(g) {
   const row = el('button', '', 'eventRow sessionRow');
@@ -576,13 +995,14 @@ function sessionRow(g) {
   const top = el('span', '', 'eventTop');
   const title = el('b', g.title || 'Session');
   title.title = g.title || '';
-  top.append(el('span', '', 'sessionMark'), title, el('time', time(g.last)));
-  const meta = el('span', '', 'eventPreview sessionMeta');
-  meta.append(el('span', sessionCounts(g), 'snippet'));
-  if (g.status !== 'complete')
-    meta.append(el('small', traceStatus(g.latest), 'eventStatus ' + g.status));
-  row.title = 'Session ' + g.session;
-  row.append(top, meta);
+  top.append(
+    el('span', '', 'sessionMark'),
+    title,
+    el('small', agentName(g.agent), 'sessionAgent'),
+    el('time', time(g.last)),
+  );
+  row.title = sessionCounts(g) + '\nSession ' + g.session;
+  row.append(top, previewLine(g.latest, g.latest.hit));
   row.onclick = invoke(() => activateSession(g));
   return row;
 }
@@ -654,34 +1074,54 @@ function treeRow(g, n, lane, width, flipped, byId) {
   return row;
 }
 function paintTree() {
+  treeEdgeObserver.disconnect();
   const g = activeGroup;
   $('traceRight').classList.toggle('noTree', !g);
+  syncTraceSplit();
   const box = $('treeRows');
-  if (!g) return box.replaceChildren();
+  if (!g) {
+    discardOlderPage();
+    return box.replaceChildren();
+  }
   $('treeTitle').textContent = g.title || 'Session';
   $('treeTitle').title = g.title || '';
   $('treeMeta').textContent = sessionCounts(g);
   $('mainOnly').checked = activeOnly;
-  const tree = trees.get(g.id),
-    sig = treeSignature(g);
-  if (tree?.sig !== sig) void ensureTree(g.id, g.agent, g.session, sig).catch(explain);
-  if (!tree?.nodes) return box.replaceChildren(el('p', 'Loading session…', 'hint treeHint'));
+  let tree = trees.get(g.id);
+  const sig = treeSignature(g);
+  if (workspace === 'trace' && (tree?.sig !== sig || tree.active !== activeOnly)) {
+    void ensureTree(g.id, g.agent, g.session, sig).catch(explain);
+    tree = trees.get(g.id);
+  }
+  if (!tree?.nodes) {
+    discardOlderPage();
+    const content = tree?.error
+      ? button('Retry loading session', invoke(() => ensureTree(g.id, g.agent, g.session, sig)), 'olderRequests')
+      : el('p', 'Loading session…', 'hint treeHint');
+    return box.replaceChildren(content);
+  }
   const focus = box.contains(document.activeElement),
     scroll = box.scrollTop;
   let nodes = tree.nodes
     .slice()
     .sort((a, b) => b.started - a.started || (a.entry_type === b.entry_type ? b.seq - a.seq : a.entry_type === 'repeater' ? -1 : 1));
   const active = activeBranch(nodes);
-  if (activeOnly) nodes = nodes.filter((n) => active.has(n.id));
   const layout = laneLayout(nodes, active);
   const flipped = sort === 'time' && asc;
   const order = nodes.map((n, i) => [n, layout.rows[i]]);
   if (flipped) order.reverse();
-  box.replaceChildren(
-    ...order.map(([n, lane]) => treeRow(g, n, lane, layout.width, flipped, tree.byId)),
-  );
-  box.scrollTop = scroll;
+  const rendered = order.map(([n, lane]) => treeRow(g, n, lane, layout.width, flipped, tree.byId));
+  const edge = tree.next ? el('div', '', 'treeEdge') : null;
+  if (edge) {
+    edge.setAttribute('role', 'status');
+    if (flipped) rendered.unshift(edge);
+    else rendered.push(edge);
+  }
+  const anchor = flipped ? box.scrollHeight - scroll : scroll;
+  box.replaceChildren(...rendered);
+  box.scrollTop = flipped ? box.scrollHeight - anchor : scroll;
   if (focus) box.querySelector('[aria-current=true]')?.focus({ preventScroll: true });
+  watchTreeEdge(g, tree, edge);
 }
 $('mainOnly').onchange = () => {
   activeOnly = $('mainOnly').checked;
@@ -690,54 +1130,83 @@ $('mainOnly').onchange = () => {
 function renderTurn(box) {
   const id = sessionRowId(selected.agent, selected.session);
   const tree = trees.get(id),
-    node = tree?.byId?.get(selected.id);
+    node = tree?.byId?.get(selected.id) ?? selected.turn;
   if (!node) {
+    if (selected.turn === null) {
+      renderRequestMessages(box);
+      return true;
+    }
     box.append(el('p', 'Loading session…', 'hint'));
-    if (!tree?.loading)
-      void ensureTree(id, selected.agent, selected.session, 'detail').catch(explain);
-    return;
+    if (!tree?.loading && !selected.turnLoading) {
+      const record = selected;
+      const query = new URLSearchParams({ agent: record.agent ?? '', session: record.session, focus: record.id });
+      record.turnLoading = true;
+      void api('sessions/tree?' + query, undefined, false, record.signal).then(({ node }) => {
+        record.turn = node;
+        if (record === selected && !record.signal.aborted) inspect();
+      }).catch((error) => {
+        record.turnLoading = false;
+        if (record === selected && !record.signal.aborted) explain(error);
+      });
+    }
+    return false;
   }
-  const parent = tree.byId.get(node.parent);
   const head = el('div', '', 'turnHead');
-  head.append(el('span', describeNode(node, tree.byId)));
-  if (parent) head.append(button('Go to ' + nodeRef(parent), invoke(() => select(parent.id))));
+  head.append(el('span', describeNode(node, tree?.byId ?? new Map())));
+  if (node.parent) head.append(button('Go to #' + node.parentSeq, invoke(() =>
+    select(node.parent, false, true, { id: node.parent, entry_type: 'capture' }))));
   box.append(head);
-  if (node.entry_type === 'repeater')
-    box.append(
-      el('p', 'This run replays an edited request. Compare edits in Repeater → Changes.', 'hint'),
-    );
-  else {
-    const entries = requestEntries(selected.protocol, selected.body);
-    const key = selected.protocol === 'responses' ? 'input' : 'messages';
-    const lookup = toolLookup(entries.map((e) => e.message));
-    const fresh = entries
-      .map((e, i) => [e, i])
-      .filter(([e]) => e.key === key && (e.index ?? 0) >= node.kept);
-    if (!fresh.length) box.append(el('p', 'No new input items.', 'hint'));
-    fresh.forEach(([e, i], k) =>
-      box.append(
-        messageCard(e.message, i, fresh.length <= 3 || k === fresh.length - 1, null, lookup),
-      ),
-    );
+  if (!node.parent || node.entry_type === 'repeater') {
+    renderRequestMessages(box);
+    return true;
   }
-  box.append(sectionTitle('Reply'));
-  box.append(
-    selected.response != null ? responseContent(selected.response, selected.protocol) : noReply(),
+  const entries = requestEntries(selected.protocol, selected.body);
+  const key = selected.protocol === 'responses' ? 'input' : 'messages';
+  const lookup = toolLookup(entries.map((e) => e.message));
+  const fresh = entries
+    .map((e, i) => [e, i])
+    .filter(([e]) => e.key === key && (e.index ?? 0) >= node.kept);
+  if (!fresh.length) box.append(el('p', 'No new input items.', 'hint'));
+  fresh.forEach(([e, i], k) =>
+    box.append(
+      messageCard(e.message, i, fresh.length <= 3 || k === fresh.length - 1, null, lookup),
+    ),
   );
+  return true;
 }
-function loadEvent(id, entryType) {
-  return api((entryType === 'repeater' ? 'snapshot/' : 'calls/') + id);
+function loadEvent(id, entryType, part, signal, before) {
+  const path = (entryType === 'repeater' ? 'snapshot/' : 'calls/') + id;
+  const query = new URLSearchParams();
+  if (part) query.set('part', part);
+  if (before !== undefined) query.set('before', String(before));
+  return api(path + (query.size ? '?' + query : ''), undefined, false, signal);
 }
-async function select(id, open = false, jump = true) {
+async function select(id, open = false, jump = true, suppliedRow, reload = false) {
   const epoch = ++detailEpoch;
-  const row = rowIndex.get(id) ?? treeEntry(id);
+  const row = rowIndex.get(id) ?? treeEntry(id) ?? suppliedRow ?? (selected?.id === id ? selected : null);
   if (!row || row.entry_type === 'session') return;
   const changed = selected?.id !== id;
-  if (selected?.id !== id) {
-    const c = await loadEvent(id, row.entry_type);
+  if (changed || reload || selected.signal.aborted) {
+    selectionController?.abort();
+    selectionController = new AbortController();
+    const { signal } = selectionController;
+    const previous = selected;
+    let meta;
+    try {
+      meta = await loadEvent(id, row.entry_type, 'meta', signal);
+    } catch (error) {
+      if (!signal.aborted) throw error;
+      return;
+    }
     if (epoch !== detailEpoch) return;
-    selected = parseCall(c);
-    hTab = selected.session ? 'This turn' : 'Messages';
+    selected = { ...meta, signal };
+    if (changed) {
+      traceView = preferredTraceView(selected);
+      followingHit = false;
+    } else {
+      for (const field of ['body', 'historyPage', 'historyView'])
+        if (Object.hasOwn(previous, field)) selected[field] = previous[field];
+    }
     const group = selected.session ? sessionRowId(selected.agent, selected.session) : null;
     if (activeGroup?.id !== group) {
       activeGroup = group ? (rowIndex.get(group) ?? activeGroup) : null;
@@ -755,14 +1224,14 @@ async function select(id, open = false, jump = true) {
   if (changed || hitRecord !== id || hitQuery !== filters.query()) {
     hitRecord = id;
     hitQuery = filters.query();
-    activeHits = row.hit
-      ? searchConditions(hitQuery).flatMap(query =>
-          [...rankedHits(selected.body, selected.response, query, row.hit.kept)])
-      : [];
+    selected.searchHit = row.hit;
+    selected.prefetching = false;
+    activeHits = row.hit ? [row.hit] : [];
     hitIndex = 0;
+    if (!activeHits.length) followingHit = false;
   }
   if (jump && activeHits.length) focusHit(hitIndex);
-  else if (changed || !jump) inspect(true);
+  else if (changed || reload || !jump) inspect(true);
   if (open) await fork();
 }
 function paintRows() {
@@ -786,9 +1255,13 @@ function resetHistory(cursor) {
   listEpoch++;
   runEpoch++;
   detailEpoch++;
+  selectionController?.abort();
+  detachHistory($('inspectView'));
   selected = source = draft = cleanDraft = snapshot = field = null;
+  viewContinuation(null, null);
   dirty = typing = false;
   rows = [];
+  rowIndex.clear();
   runs = [];
   saved = [];
   undoStack = [];
@@ -796,6 +1269,7 @@ function resetHistory(cursor) {
   writer?.dispose();
   writer = null;
   tabUndo.clear();
+  tabPositions.clear();
   paintTabStrip([]);
   openMessages.clear();
   runId = 'original';
@@ -807,6 +1281,8 @@ function resetHistory(cursor) {
   $('inspector').hidden = true;
   activeGroup = null;
   trees.clear();
+  sessionViews.clear();
+  followingHit = false;
   paintTree();
   $('trace').classList.remove('showDetail');
   setWorkspace(workspace);
@@ -837,10 +1313,20 @@ function agentIcon(id) {
   return badge;
 }
 
+const { view: viewContinuation, refresh: refreshContinuations } = continuePicker({
+  root: $('continueControls'), menu: $('continueMenu'), choices: $('continueChoices'),
+  launch: $('continueAgent'), message: $('continueMessage'), api, agentIcon, agentName,
+  currentRequest: () => {
+    if (field?.error) throw Error(field.error);
+    if (!draft) throw Error('No request draft is open.');
+    return draft;
+  },
+  confirmRead: (id, path) => confirmAction('This run asks ' + agentName(id) + ' to read this file and send its contents to the run model: ' + path, 'Continue with file read'),
+});
 function paintScope(agents) {
   const summary = $('scopeSummary');
   const label =
-    agents === 'all' ? allAgentsName : agents.map(agentName).join(', ') || 'Waiting for an agent';
+    agents === 'all' ? allAgentsName : agents.map(agentName).join(', ') || 'No agents selected';
   summary.title = 'Capture scope: ' + label;
   summary.setAttribute('aria-label', summary.title);
   const signature = JSON.stringify(agents);
@@ -864,33 +1350,52 @@ function paintRecording(data) {
 
 function scopeOptions(choices, selected) {
   const group = el('fieldset'),
-    options = el('div', '', 'scopeOptions');
+    options = el('div', '', 'scopeOptions'),
+    candidates = new Set(choices),
+    picks = new Set(selected === 'all' ? [] : selected),
+    original = new Set([...candidates, ...picks]),
+    added = new Set(),
+    removed = new Set();
   group.append(el('legend', 'Agents'));
-  function check(value, parent, checked) {
-    const row = el('label'),
-      input = el('input');
+  function check(value, checked) {
+    const row = el('div', '', 'scopeChoice'),
+      label = el('label'),
+      input = el('input'),
+      name = value ? agentName(value) : allAgentsName;
     input.type = 'checkbox';
     input.checked = checked;
-    row.append(
-      input,
-      agentIcon(value),
-      document.createTextNode(value ? agentName(value) : allAgentsName),
-    );
-    parent.append(row);
-    return input;
+    label.append(agentIcon(value), el('span', name, 'scopeName'), input);
+    row.append(label);
+    return { row, input };
   }
-  const all = check(null, group, selected === 'all');
-  const picks = new Set(selected === 'all' ? [] : selected);
+  const { row: allRow, input: all } = check(null, selected === 'all');
+  allRow.classList.add('scopeAll');
+  allRow.title = 'Record all local agents, including agents hidden from this list.';
+  group.append(allRow);
   function drawOptions() {
+    const scroll = options.scrollTop;
     options.replaceChildren();
-    for (const name of [...new Set([...choices, ...picks])].sort()) {
-      const item = check(name, options, picks.has(name));
-      item.onchange = () => {
+    [...new Set([...candidates, ...picks])].sort().forEach((name, index) => {
+      const { row, input } = check(name, picks.has(name));
+      input.onchange = () => {
         all.checked = false;
-        if (item.checked) picks.add(name);
+        if (input.checked) picks.add(name);
         else picks.delete(name);
       };
-    }
+      const remove = toolButton(icon('trash'), 'Remove ' + agentName(name), () => {
+        candidates.delete(name);
+        picks.delete(name);
+        added.delete(name);
+        if (original.has(name)) removed.add(name);
+        drawOptions();
+        const next = options.children[Math.min(index, options.children.length - 1)];
+        (next?.querySelector('input') ?? all).focus();
+      });
+      remove.classList.add('scopeRemove');
+      row.append(remove);
+      options.append(row);
+    });
+    options.scrollTop = scroll;
   }
   all.onchange = () => {
     if (all.checked) {
@@ -900,15 +1405,21 @@ function scopeOptions(choices, selected) {
   };
   drawOptions();
   const line = el('div', '', 'scopeManual'),
-    input = el('input');
-  input.placeholder = 'Enter an agent ID';
+    input = el('input'),
+    hint = el('p', '', 'scopeHint');
+  hint.id = 'scopeAgentHint';
+  hint.append('For API key ', el('code', 'magpie-xxx'), ', enter ', el('code', 'xxx'), '.');
+  input.placeholder = 'Agent ID';
   input.setAttribute('aria-label', input.placeholder);
+  input.setAttribute('aria-describedby', hint.id);
   function add() {
     const value = input.value.trim();
     if (!value) return;
     all.checked = false;
     picks.add(value);
-    choices = [...new Set([...choices, value])];
+    if (!candidates.has(value)) added.add(value);
+    candidates.add(value);
+    removed.delete(value);
     drawOptions();
     input.value = '';
   }
@@ -919,13 +1430,11 @@ function scopeOptions(choices, selected) {
     }
   };
   line.append(input, button('Add', add));
-  group.append(options, line);
+  group.append(options, line, hint);
   $('scopeFields').append(group);
   return () => {
     add();
-    if (all.checked) return 'all';
-    if (!picks.size) throw Error('Select an agent or choose “All local agents”.');
-    return [...picks].sort();
+    return { agents: all.checked ? 'all' : [...picks].sort(), add: [...added], remove: [...removed] };
   };
 }
 let menuEpoch = 0;
@@ -937,16 +1446,16 @@ $('scopeSummary').onclick = invoke(async (e) => {
   $('scopeApply').disabled = true;
   $('scopeFields').replaceChildren();
   $('scopeError').textContent = '';
-  const { scope, choices } = await api('capture-scope');
+  const state = await api('capture-scope');
   if (epoch !== menuEpoch || !$('scopeMenu').open) return;
-  const agents = scopeOptions(choices.agents, scope.agents);
+  paintRecording(state);
+  const { scope, choices } = state;
+  const changes = scopeOptions(choices.agents, scope.agents);
   $('scopeApply').disabled = false;
   $('scopeApply').onclick = async () => {
     $('scopeApply').disabled = true;
     try {
-      const state = await api('capture-scope', {
-        agents: agents(),
-      });
+      const state = await api('capture-scope', changes());
       paintRecording(state);
       if (epoch === menuEpoch && $('scopeMenu').open) {
         $('scopeMenu').open = false;
@@ -1002,12 +1511,17 @@ async function list() {
     (rowIndex.has(item.id) || (!!item.session && rowIndex.has(sessionRowId(item.agent, item.session))));
   if (query !== listQuery && !listed(selected)) {
     detailEpoch++;
+    selectionController?.abort();
     selected = null;
     $('inspector').hidden = true;
     $('emptyInspect').hidden = false;
   }
   const queryChanged = query !== listQuery;
   listQuery = query;
+  if (offset && !rows.length) {
+    offset = Math.max(0, Math.floor((data.total - 1) / 100) * 100);
+    return list();
+  }
   const paged = !!offset || data.more;
   $('count').textContent = paged
     ? `${offset + 1}–${offset + rows.length} / ${data.total}`
@@ -1029,6 +1543,7 @@ async function list() {
   $('prev').disabled = !offset;
   $('next').disabled = !data.more;
   $('direction').textContent = asc ? '↑ Ascending' : '↓ Descending';
+  const previousGroup = activeGroup;
   if (activeGroup) {
     if (rowIndex.has(activeGroup.id)) activeGroup = rowIndex.get(activeGroup.id);
     else if (queryChanged) activeGroup = null;
@@ -1037,25 +1552,28 @@ async function list() {
   if (sig !== rowSignature) {
     rowSignature = sig;
     paintRows();
+  }
+  if (queryChanged || JSON.stringify(activeGroup) !== JSON.stringify(previousGroup)) {
     paintTree();
   }
-  if (!selected && rows.length) {
-    if (rows[0].entry_type === 'session') await activateSession(rows[0]);
-    else await select(rows[0].id);
-  }
-  else if (queryChanged && listed(selected)) {
-    if (!q && activeHits.length) hTab = 'Messages';
+  if (queryChanged && listed(selected)) {
+    if (!q) followingHit = false;
     await select(selected.id, false, !!q);
     if (!activeHits.length) inspect();
   }
-  const row = rowIndex.get(selected?.id);
-  if (row && row.entry_type !== 'session' && (row.status !== selected.status || row.ended !== selected.ended)) {
-    const c = await loadEvent(row.id, row.entry_type);
-    if (c.id === selected?.id) {
-      selected = parseCall(c);
-      hitRecord = '';
-      await select(c.id, false, false);
+  let row = rowIndex.get(selected?.id);
+  if (!row && selected?.status.startsWith('checking')) {
+    const record = selected;
+    row = await loadEvent(record.id, record.entry_type, 'meta', record.signal);
+    if (record !== selected || epoch !== listEpoch) return;
+    const node = activeGroup && trees.get(activeGroup.id)?.byId?.get(record.id);
+    if (node && node.status !== row.status) {
+      Object.assign(node, { status: row.status, ended: row.ended });
+      paintTree();
     }
+  }
+  if (row && !selected.signal.aborted && (row.status !== selected.status || row.ended !== selected.ended)) {
+    await select(row.id, false, false, row, true);
   }
 }
 function persistentState() {
@@ -1063,6 +1581,7 @@ function persistentState() {
     draft,
     open: [...openMessages],
     tab: dTab,
+    beforeChanges: dTab === 'Changes' ? beforeChanges : undefined,
     field: field && {
       key: field.key,
       text: field.text,
@@ -1070,30 +1589,13 @@ function persistentState() {
       prettySource: field.projection?.original ?? null,
     },
     dirty,
-    rTab,
+    rTab: source?.legacyRunTab,
   };
 }
-let statusTimer,
-  lastSaveError = '';
 function saveStatus(label, message = '') {
-  clearTimeout(statusTimer);
-  if (!message && (label === 'Saved' || !label) && $('notice').textContent === lastSaveError) {
-    $('notice').textContent = '';
-    lastSaveError = '';
-  }
   const indicator = $('saveStatus');
-  indicator.hidden = !label;
-  indicator.textContent = label;
-  if (label === 'Saved')
-    statusTimer = setTimeout(() => {
-      indicator.hidden = true;
-    }, 1000);
-  indicator.title = message || label;
-  indicator.disabled = label !== 'Save failed';
-  if (message) {
-    lastSaveError = message;
-    explain(Error(message));
-  }
+  indicator.hidden = label !== 'Save failed';
+  indicator.textContent = message ? `${message} · Retry save` : 'Save failed · Retry';
 }
 function paintTabStrip(tabs) {
   const strip = $('draftList'),
@@ -1134,12 +1636,16 @@ function paintTabStrip(tabs) {
   }
   if (!closed.childElementCount) closed.append(el('small', 'No closed tabs'));
   for (const id of ['copyTab', 'renameTab', 'deleteTab']) $(id).disabled = !source;
+  if (!source) $('undo').disabled = $('redo').disabled = true;
 }
 async function installWorkspace(data, view) {
+  repeaterLoaded = true;
+  rememberPosition();
   writer?.dispose();
   writer = null;
   if (source) tabUndo.set(source.id, { undoStack, redoStack });
   source = data.tab;
+  viewContinuation(source, null);
   snapshot = null;
   runs = [];
   saved = [];
@@ -1156,7 +1662,14 @@ async function installWorkspace(data, view) {
     cleanDraft = state.dirty ? null : state.draft;
     runId = source.selected_run;
     const legacyChanges = state.rTab === 'Changes';
-    rTab = legacyChanges ? 'Answer' : state.rTab || 'Answer';
+    beforeChanges = (legacyChanges ? state.tab : state.beforeChanges) === 'Full JSON' ||
+      state.field?.key === 'request' ? 'Full JSON' : 'Messages';
+    if (!source.run_view && ['Response JSON', 'Request snapshot'].includes(state.rTab))
+      source.legacyRunTab = state.rTab;
+    runView = source.run_view ?? {
+      tab: state.rTab === 'Request snapshot' ? 'Request snapshot' : 'Reply',
+      raw: state.rTab === 'Response JSON',
+    };
     const restoredField = state.field && {
       ...state.field,
       projection:
@@ -1187,8 +1700,12 @@ async function installWorkspace(data, view) {
   paintTabStrip(data.tabs);
   $('tabMenu').open = false;
   setWorkspace(view);
-  if (source && view === 'repeater') await updateRuns(true);
-  if (view === 'settings') paintMcp(await api('settings/mcp'));
+  if (source && view === 'repeater') {
+    restorePosition();
+    paintRun();
+    await updateRuns(true);
+  }
+  if (view === 'settings') await loadSettings();
 }
 async function tabAction(action, args = {}) {
   if (
@@ -1208,10 +1725,13 @@ async function tabAction(action, args = {}) {
         args.state = persistentState();
       }
     } else if (writer) await writer.flush();
-    await viewWrite;
+    await Promise.all([viewWrite, preferenceWrites]);
     const data = await api('tabs/' + action, args);
     await installWorkspace(data, 'repeater');
-    if (action === 'delete') tabUndo.delete(args.id);
+    if (action === 'delete') {
+      tabUndo.delete(args.id);
+      tabPositions.delete(args.id);
+    }
   } finally {
     $('repeat').inert = false;
     switching = false;
@@ -1297,9 +1817,9 @@ function toolButton(symbol, label, fn) {
 function focusField() {
   $('draftView').querySelector('.inlineSource')?.focus();
 }
-function openField(key, value, projection = null) {
+function openField(key, value) {
   if (field?.error) return focusField();
-  field = { key, text: projection?.text ?? value, error: '', projection };
+  field = { key, text: value, error: '' };
   typing = false;
   renderDraft();
   focusField();
@@ -1471,6 +1991,8 @@ const editActions = {
   },
   part(index, i, part, label) {
     const key = index + '/' + i;
+    const editingJson = field?.key === key + '/json';
+    const editing = editingJson || field?.key === key;
     const array = Array.isArray(draftEntries()[index].message.content);
     const isText = isTextBlock(part);
     const controls = [];
@@ -1491,11 +2013,13 @@ const editActions = {
     const currentPart = () =>
       array ? draftEntries()[index].message.content[i] : draftEntries()[index].message.content;
     const source = () => {
-      if (field?.key === key + '/json') closeField();
+      if (editing) closeField();
       else openField(key + '/json', pretty(currentPart()));
     };
+    const toggle = toolButton('{}', editing ? 'Back to preview' : 'Block JSON', source);
+    toggle.setAttribute('aria-expanded', String(editing));
     controls.push(
-      toolButton('{}', 'Block JSON', source),
+      toggle,
       toolButton(icon('trash'), 'Delete block', () => {
         const entry = draftEntries()[index];
         if (entry.message !== entry.value && (entry.index !== null || !Array.isArray(entry.value)))
@@ -1506,15 +2030,20 @@ const editActions = {
         });
       }),
     );
-    if (field?.key === key || field?.key === key + '/json') {
-      const json = field.key.endsWith('/json');
+    if (editing) {
+      if (!editingJson && !field.projection) {
+        field.projection = prettyEditorText(field.text);
+        field.text = field.projection.text;
+      }
       const section = el('section', '', 'contentText');
-      const editor = inlineSource(json ? 'Block JSON' : 'Edit text', (text) => {
+      const editor = inlineSource(editingJson ? 'Block JSON' : 'Edit text', (text) => {
         const prev = currentPart();
         if (field.projection) text = field.projection.encode(text);
-        const next = json ? JSON.parse(text) : typeof prev === 'string' ? text : { ...prev, text };
+        const next = editingJson
+          ? JSON.parse(text)
+          : typeof prev === 'string' ? text : { ...prev, text };
         if (
-          json &&
+          editingJson &&
           (next == null ||
             (typeof next !== 'object' && typeof next !== 'string') ||
             Array.isArray(next))
@@ -1523,10 +2052,7 @@ const editActions = {
         return editedPart(index, i, next);
       });
       section.append(
-        sectionTitle(label, [
-          toolButton(icon('pretty'), 'Back to preview', closeField),
-          ...controls,
-        ]),
+        sectionTitle(label, controls),
         field.projection ? highlightedEditor(editor) : editor,
       );
       return section;
@@ -1541,7 +2067,7 @@ const editActions = {
     const text = typeof part === 'string' ? part : part.text;
     const section = textBlock(label, text, controls);
     editOnClick(section.querySelector('.contentView'), 'Click to edit text', () =>
-      openField(key, text, section.dataset.mode === 'pretty' ? prettyEditorText(text) : null),
+      openField(key, text),
     );
     if (typeof part === 'object') {
       const extra = Object.fromEntries(
@@ -1552,28 +2078,28 @@ const editActions = {
     return section;
   },
 };
+function chooseDraftView(view) {
+  if (view === 'Changes') beforeChanges = dTab;
+  else {
+    const editorView = field?.key === 'request' ? 'Full JSON' : 'Messages';
+    if (field?.error && view !== editorView) {
+      dTab = editorView;
+      renderDraft();
+      return focusField();
+    }
+    if (view !== editorView) field = null;
+  }
+  dTab = view;
+  renderDraft();
+  markDraft();
+}
+$('draftFormat').onclick = () => chooseDraftView(dTab === 'Full JSON' ? 'Messages' : 'Full JSON');
+$('draftChanges').onclick = () => chooseDraftView(dTab === 'Changes' ? beforeChanges : 'Changes');
 function renderDraft() {
   if (!draft) return;
   draftStatus();
-  tabs('draftTabs', ['Messages', 'Full JSON', 'Changes'], dTab, (v) => {
-    if (v === dTab) return;
-    if (v === 'Changes' || dTab === 'Changes') {
-      // Keep even incomplete editor text available while inspecting its diff.
-      const editorTab = field?.key === 'request' ? 'Full JSON' : 'Messages';
-      if (field?.error && v !== 'Changes' && v !== editorTab) {
-        dTab = editorTab;
-        renderDraft();
-        return focusField();
-      }
-      if (v !== 'Changes' && v !== editorTab) field = null;
-      dTab = v;
-      renderDraft();
-      return;
-    }
-    if (field?.error) return focusField();
-    dTab = v;
-    closeField();
-  });
+  $('draftFormat').setAttribute('aria-pressed', String(dTab === 'Full JSON'));
+  $('draftChanges').setAttribute('aria-pressed', String(dTab === 'Changes'));
   const box = $('draftView'),
     scroll = box.scrollTop;
   box.replaceChildren();
@@ -1606,7 +2132,7 @@ function renderDraft() {
   }
   box.scrollTop = scroll;
 }
-function responseContent(reply, protocol = 'chat', includeEnvelope = false) {
+function responseContent(reply, protocol = 'chat') {
   const native = responseMessages(protocol, reply);
   const emptyOutput = protocol === 'responses' && native?.length === 0;
   if (!emptyOutput && !native?.length && (!Array.isArray(reply?.choices) || !reply.choices.length))
@@ -1647,14 +2173,6 @@ function responseContent(reply, protocol = 'chat', includeEnvelope = false) {
     if (choice.finish_reason && choice.finish_reason !== 'stop')
       panel.append(el('small', 'Finish reason · ' + choice.finish_reason));
   }
-  if (includeEnvelope || emptyOutput) {
-    const details = el('details', '', 'responseEnvelope');
-    details.append(el('summary', 'Full response JSON'));
-    details.ontoggle = () => {
-      if (details.open && details.childElementCount === 1) details.append(jsonPanel(reply));
-    };
-    panel.append(details);
-  }
   return panel;
 }
 function pendingRequestText() {
@@ -1682,13 +2200,17 @@ async function refreshDraftDiff(output) {
     if (output.isConnected) output.replaceChildren(el('p', error.message, 'hint'));
   }
 }
-function failurePanel(failure) {
+function failurePanel(failure, status, capture) {
   const panel = el('section', '', 'runFailure');
-  panel.append(el('strong', failure.http ? 'Gateway HTTP ' + failure.http : 'No HTTP response'));
+  const heading = { rejected: 'Request rejected', canceled: 'Request canceled',
+    unmatched: status === 'failed' ? 'Failed · gateway details unavailable' : 'Completion unconfirmed' }[failure.reason];
+  const http = failure.http ? 'Gateway HTTP ' + failure.http : '';
+  panel.append(el('strong', [heading, http].filter(Boolean).join(' · ') ||
+    (capture ? 'Request failed' : 'No HTTP response')));
   panel.append(el('p', failure.message));
   const facts = el('dl');
   for (const [name, value] of [
-    ['Error code', failure.code], ['Error type', failure.type],
+    ['Provider', failure.provider], ['Error code', failure.code], ['Error type', failure.type],
     ['Request ID', failure.requestId], ['Retry-After', failure.retryAfter],
   ]) {
     if (value) facts.append(el('dt', name), el('dd', value));
@@ -1697,55 +2219,80 @@ function failurePanel(failure) {
   if (failure.truncated) panel.append(el('small', 'Error body truncated at 8 KiB.'));
   return panel;
 }
+function hasRawReply(record) {
+  return record.response != null || Boolean(record.failure?.raw);
+}
+function replyContent(record, raw, refresh, hit) {
+  const reply = record.response;
+  const failure = record.failure;
+  if (raw) {
+    if (reply != null) return jsonPanel(reply, null, hit);
+    if (failure?.raw) {
+      const panel = el('div');
+      let parsed;
+      try {
+        parsed = JSON.parse(failure.raw);
+      } catch {}
+      panel.append(parsed === undefined ? el('pre', failure.raw) : jsonPanel(parsed));
+      if (failure.truncated) panel.append(el('small', 'Error body truncated at 8 KiB.'));
+      return panel;
+    }
+  }
+  if (failure && ['failed', 'canceled', 'unconfirmed'].includes(record.status)) {
+    const panel = el('div');
+    panel.append(failurePanel(failure, record.status, record.entry_type === 'capture'));
+    if (reply?.output?.length) panel.append(responseContent(reply, record.protocol));
+    return panel;
+  }
+  if (record.recovered_output?.length) {
+    const panel = el('div');
+    panel.append(
+      el('p', 'Output recovered from the local Codex log.', 'hint'),
+      responseContent({ ...reply, output: record.recovered_output }, record.protocol),
+    );
+    return panel;
+  }
+  return reply != null ? responseContent(reply, record.protocol) : noReply(record, refresh);
+}
+function chooseRunView(view) {
+  runView = { ...runView, ...view };
+  saveViewPreference({ id: source.id, ...runView }, 'tabs/run-view');
+  paintRun();
+}
 function paintRun() {
-  tabs('runTabs', ['Answer', 'Response JSON', 'Request snapshot'], rTab, (v) => {
-    rTab = v;
-    paintRun();
-  });
+  viewContinuation(source, snapshot);
+  const inSnapshot = runView.tab === 'Request snapshot';
+  $('replyTitle').textContent = runView.tab;
+  $('backToReply').hidden = !inSnapshot;
+  $('viewSnapshot').hidden = inSnapshot;
+  $('viewSnapshot').disabled = !snapshot?.body;
   const s = snapshot || {},
     reply = s.response,
     box = $('runView');
+  formatToggle('runFormat', 'reply', runView.tab === 'Reply' && hasRawReply(s), runView.raw,
+    () => chooseRunView({ raw: !runView.raw }));
   box.replaceChildren();
   $('restore').disabled = !s.body || posting;
   $('runMeta').textContent = [
-    runId === 'original' && (traceStatus(s) || 'Loading…'),
-    s.ended != null ? s.ended - s.started + ' ms' : '',
-    reply?.usage?.total_tokens != null ? reply.usage.total_tokens + ' tokens' : '',
+    s.ended != null ? ((s.ended - s.started) / 1000).toLocaleString('en', { maximumFractionDigits: 2 }) + ' s' : '',
+    reply?.usage?.total_tokens != null ? reply.usage.total_tokens.toLocaleString('en') + ' tokens' : '',
   ]
     .filter(Boolean)
     .join(' · ');
-  if (rTab === 'Request snapshot' && s.body) box.append(jsonPanel(s.body));
-  else if (s.status === 'failed' && s.failure) {
-    if (rTab === 'Response JSON' && reply) box.append(jsonPanel(reply));
-    else if (rTab === 'Response JSON' && s.failure.raw) {
-      let raw;
-      try { raw = JSON.parse(s.failure.raw); } catch {}
-      box.append(raw === undefined ? el('pre', s.failure.raw) : jsonPanel(raw));
-      if (s.failure.truncated) box.append(el('small', 'Error body truncated at 8 KiB.'));
-    } else {
-      box.append(failurePanel(s.failure));
-      if (reply?.output?.length) box.append(responseContent(reply, source.protocol));
-    }
-  }
-  else if (s.status === 'queued') box.append(queuedMessage(s.id, () => updateRuns(true)));
-  else if (reply)
-    box.append(
-      rTab === 'Response JSON' ? jsonPanel(reply) : responseContent(reply, source.protocol),
-    );
-  else
-    box.append(
-      el(
-        'p',
-        s.error ||
-          ({
-            running: 'Waiting for the model…',
-            draft: 'This draft has not been sent.',
-            canceled: 'Canceled before sending.',
-          }[s.status] || 'No complete response available.'),
-        'hint',
-      ),
-    );
+  if (!snapshot) box.append(el('p', 'Loading…', 'hint'));
+  else if (inSnapshot) {
+    if (s.body) box.append(jsonPanel(s.body));
+  } else box.append(replyContent(s, runView.raw, () => updateRuns(true)));
 }
+$('viewSnapshot').onclick = () => {
+  $('runMenu').open = false;
+  chooseRunView({ tab: 'Request snapshot' });
+  $('backToReply').focus();
+};
+$('backToReply').onclick = () => {
+  chooseRunView({ tab: 'Reply' });
+  $('runMenu').querySelector('summary').focus();
+};
 async function updateRuns(force = false) {
   if (!source) return;
   const id = source.id,
@@ -1774,7 +2321,7 @@ async function updateRuns(force = false) {
     force ||
     snapshot?.id !== (picked === 'original' ? baseId : picked) ||
     (info && info.status !== snapshot?.status) ||
-    (picked === 'original' && ['pending', 'queued', 'running'].includes(snapshot?.status))
+    (picked === 'original' && ['pending', 'checking', 'checking_unknown', 'queued', 'running'].includes(snapshot?.status))
   ) {
     const s =
       picked === 'original'
@@ -1800,8 +2347,10 @@ async function send() {
     const r = await api('tabs/send', { id, revision });
     if (source?.id === id) {
       runId = r.id;
-      rTab = 'Answer';
+      viewContinuation(source, null);
       snapshot = null;
+      if (runView.tab !== 'Reply') chooseRunView({ tab: 'Reply' });
+      else paintRun();
       const previouslyDirty = dirty;
       cleanDraft = body;
       dirty = draft !== body || !!field?.error;
@@ -1817,16 +2366,24 @@ async function send() {
   }
 }
 $('runSelect').onchange = invoke(async () => {
-  const id = source.id,
-    picked = $('runSelect').value;
-  await api('tabs/pick', { id, run: picked });
-  if (source?.id !== id) return;
+  const id = source.id, previous = runId, picked = $('runSelect').value;
   runId = picked;
   snapshot = null;
+  ++runEpoch;
   paintRun();
-  await updateRuns(true);
+  try {
+    await api('tabs/pick', { id, run: picked });
+  } catch (error) {
+    if (source?.id === id && runId === picked) {
+      runId = previous;
+      await updateRuns(true);
+    }
+    throw error;
+  }
+  if (source?.id === id && runId === picked) await updateRuns(true);
 });
 $('restore').onclick = invoke(async () => {
+  $('runMenu').open = false;
   const body = snapshot?.body;
   if (
     body &&
@@ -1839,57 +2396,86 @@ $('restore').onclick = invoke(async () => {
     commit(body, requestEntries(source.protocol, body).length - 1, 'Messages');
   }
 });
-function bindSplitter(split, handle, initial, stacked) {
-  const splitSizes = { width: initial, height: initial };
-  function setSplit(percent) {
-    const size = Math.max(25, Math.min(75, percent));
-    splitSizes[stacked?.matches ? 'height' : 'width'] = size;
+const splitSizes = new Map();
+function bindSplitter(split, handle, initial, mode, stacked) {
+  function syncSplit() {
+    const size = splitSizes.get(mode()) ?? initial;
     split.style.setProperty('--first-share', size + 'fr');
     split.style.setProperty('--second-share', 100 - size + 'fr');
     handle.setAttribute('aria-orientation', stacked?.matches ? 'horizontal' : 'vertical');
     handle.setAttribute('aria-valuenow', String(Math.round(size)));
   }
-  function syncSplit() {
-    setSplit(splitSizes[stacked?.matches ? 'height' : 'width']);
+  function setSplit(percent) {
+    const key = mode();
+    const size = Math.max(25, Math.min(75, percent));
+    if (size === (splitSizes.get(key) ?? initial)) return false;
+    splitSizes.set(key, size);
+    syncSplit();
+    return true;
+  }
+  function saveSize(key) {
+    saveViewPreference({ split: key, percent: splitSizes.get(key) });
+  }
+  function resize(percent) {
+    if (setSplit(percent)) saveSize(mode());
   }
   stacked?.addEventListener('change', syncSplit);
   syncSplit();
-  let dragOffset = 0;
+  let drag;
   handle.onpointerdown = (e) => {
     if (!e.isPrimary || e.button !== 0) return;
     const rect = handle.getBoundingClientRect();
-    dragOffset = stacked?.matches ? e.clientY - rect.top : e.clientX - rect.left;
+    drag = {
+      key: mode(),
+      size: splitSizes.get(mode()) ?? initial,
+      offset: stacked?.matches ? e.clientY - rect.top : e.clientX - rect.left,
+    };
     handle.setPointerCapture(e.pointerId);
   };
   handle.onpointermove = (e) => {
-    if (!handle.hasPointerCapture(e.pointerId)) return;
+    if (drag?.key !== mode() || !handle.hasPointerCapture(e.pointerId)) return;
     const rect = split.getBoundingClientRect();
     const extent = stacked?.matches
       ? rect.height - handle.offsetHeight
       : rect.width - handle.offsetWidth;
     const pos = stacked?.matches ? e.clientY - rect.top : e.clientX - rect.left;
-    if (extent > 0) setSplit((100 * (pos - dragOffset)) / extent);
+    if (extent > 0) setSplit((100 * (pos - drag.offset)) / extent);
   };
-  handle.ondblclick = () => setSplit(initial);
+  handle.onlostpointercapture = () => {
+    if (drag && (splitSizes.get(drag.key) ?? initial) !== drag.size) saveSize(drag.key);
+    drag = null;
+  };
+  handle.ondblclick = () => resize(initial);
   handle.onkeydown = (e) => {
     const size = Number(handle.getAttribute('aria-valuenow'));
     const step = stacked?.matches ? ['ArrowUp', 'ArrowDown'] : ['ArrowLeft', 'ArrowRight'];
-    if (e.key === step[0]) setSplit(size - 5);
-    else if (e.key === step[1]) setSplit(size + 5);
-    else if (e.key === 'Home') setSplit(25);
-    else if (e.key === 'End') setSplit(75);
+    if (e.key === step[0]) resize(size - 5);
+    else if (e.key === step[1]) resize(size + 5);
+    else if (e.key === 'Home') resize(25);
+    else if (e.key === 'End') resize(75);
     else return;
     e.preventDefault();
   };
+  return syncSplit;
 }
-bindSplitter($('trace'), $('traceHandle'), 30);
-bindSplitter($('traceRight'), $('treeHandle'), 40);
-bindSplitter($('repeatSplit'), $('splitHandle'), 50, window.matchMedia('(max-width: 760px)'));
+const syncTraceSplit = bindSplitter(
+  $('trace'),
+  $('traceHandle'),
+  30,
+  () => activeGroup ? 'trace-session' : 'trace-flat',
+);
+const syncTreeSplit = bindSplitter($('traceRight'), $('treeHandle'), 40, () => 'session-tree');
+const stackedRepeater = window.matchMedia('(max-width: 760px)');
+const syncRepeaterSplit = bindSplitter(
+  $('repeatSplit'),
+  $('splitHandle'),
+  50,
+  () => stackedRepeater.matches ? 'repeater-stacked' : 'repeater-wide',
+  stackedRepeater,
+);
 $('filterButton').append(icon('sliders'));
-$('undo').replaceChildren(icon('undo'));
-$('redo').replaceChildren(icon('redo'));
 $('pickTrace').onclick = () => $('toTrace').click();
-for (const id of ['filterMenu', 'metaMenu', 'tabMenu']) {
+for (const id of ['filterMenu', 'metaMenu', 'tabMenu', 'runMenu']) {
   const menu = $(id);
   document.addEventListener('pointerdown', (e) => {
     if (menu.open && !menu.contains(e.target)) menu.open = false;
@@ -1909,14 +2495,25 @@ $('toTrace').onclick = invoke(async () => {
   await list();
 });
 $('toRepeat').onclick = invoke(async () => {
+  if (switching) return;
   setWorkspace('repeater', true);
-  if (source) await updateRuns(true);
+  if (repeaterLoaded) {
+    if (source) await updateRuns(true);
+    return;
+  }
+  switching = true;
+  try {
+    const data = await api('tabs/workspace');
+    if (workspace === 'repeater') await installWorkspace(data, 'repeater');
+  } finally {
+    switching = false;
+  }
 });
 $('record').onclick = invoke(async () => {
   $('record').disabled = true;
   try {
-    await api('recording', { enabled: !recording });
-    await list();
+    paintRecording(await api('recording', { enabled: !recording }));
+    if (workspace === 'trace') await list();
   } finally {
     $('record').disabled = false;
   }
@@ -1968,7 +2565,7 @@ $('next').onclick = invoke(async () => {
 $('draftView').addEventListener(
   'click',
   (event) => {
-    if (field?.error && !event.target.closest('.inlineSource')) {
+    if (field?.error && !event.target.closest('.inlineSource, .editTool[aria-expanded="true"]')) {
       event.preventDefault();
       event.stopPropagation();
       focusField();
@@ -2032,34 +2629,52 @@ document.addEventListener(
       const next = all[all.indexOf(tr) + (e.key === 'ArrowDown' ? 1 : -1)];
       if (next) {
         next.focus();
-        if (next.classList.contains('sessionRow')) await activateSession(rowIndex.get(next.dataset.id));
-        else await select(next.dataset.id);
+        if (!next.classList.contains('sessionRow')) await select(next.dataset.id);
       }
     }
   }),
 );
 async function poll() {
   try {
-    if (workspace === 'trace' || !rows.length) await list();
+    if (workspace === 'trace') await list();
     else paintRecording(await api('recording'));
     if (workspace === 'repeater' && source && !posting) await updateRuns();
   } catch (e) {
     explain(e);
   }
+  schedulePoll();
+}
+function schedulePoll() {
   setTimeout(poll, document.hidden ? 6000 : 2000);
 }
 async function initialize() {
   document.querySelector('body').inert = true;
   try {
-    await prepareReload();
-    await list();
-    const data = await api('tabs/workspace');
-    await installWorkspace(data, data.view);
+    const [, data] = await Promise.all([prepareReload(), api('tabs/workspace?defer=1')]);
+    for (const [key, size] of Object.entries(data.splits ?? {})) {
+      if (Number.isFinite(size) && size >= 25 && size <= 75) splitSizes.set(key, size);
+    }
+    syncTraceSplit();
+    syncTreeSplit();
+    syncRepeaterSplit();
+    if (data.deferred) {
+      setWorkspace(data.view);
+      if (data.view === 'trace') await list();
+      else {
+        const [recording] = await Promise.all([api('recording'), loadSettings()]);
+        paintRecording(recording);
+      }
+    } else {
+      await Promise.all([
+        installWorkspace(data, data.view),
+        data.view === 'trace' ? list() : api('recording').then(paintRecording),
+      ]);
+    }
   } catch (e) {
     explain(e);
   } finally {
     document.querySelector('body').inert = false;
-    poll();
+    schedulePoll();
   }
 }
 initialize();

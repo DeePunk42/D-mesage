@@ -1,5 +1,5 @@
 import { test, expect, afterAll } from 'bun:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 process.env.D_MESSAGE_DATA_DIR = mkdtempSync(join(tmpdir(), 'd-message-test-'));
@@ -19,7 +19,7 @@ const mock = Bun.serve({
       return Response.json({ agents: { claude: { model: 'mock' } } });
     if (path === '/v1/magpie/usage/requests')
       return Response.json({
-        agents: [{ id: 'claude' }, { id: 'codex' }, { id: 'tracefork' }, { id: 'd-message' }],
+        agents: [{ id: 'alpha-client' }, { id: 'claude' }, { id: 'codex' }, { id: 'tracefork' }, { id: 'd-message' }],
       });
     const b = await r.json();
     seen.push({ name: r.headers.get('User-Agent'), body: b });
@@ -54,6 +54,36 @@ afterAll(() => {
   storage().close();
   rmSync(process.env.D_MESSAGE_DATA_DIR, { recursive: true, force: true });
 });
+
+test('Codex reply recovery requires the matching local response ID and excludes input items', async () => {
+  const { recoverCodexOutput } = await import('../codex-reply.js');
+  const home = join(dataDir, 'codex-fixture');
+  const sessions = join(home, 'sessions', '2026', '11', '20');
+  mkdirSync(sessions, { recursive: true });
+  const session = crypto.randomUUID();
+  const started = Date.UTC(2026, 10, 20);
+  const record = (type, offset, payload) =>
+    JSON.stringify({ type, timestamp: new Date(started + offset).toISOString(), payload });
+  const assistant = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'answer' }] };
+  const received = [
+    record('session_meta', -500, { id: session }),
+    record('response_item', -100, { ...assistant, id: 'previous' }),
+    record('response_item', 50, { type: 'function_call_output', output: 'client input' }),
+    record('response_item', 80, assistant),
+    record('token_usage_record', 100, { thread_id: session, response_id: 'resp_current' }),
+    record('response_item', 105, { ...assistant, id: 'next' }),
+  ];
+  const path = join(sessions, `rollout-fixture-${session}.jsonl`);
+  const call = { agent: 'codex', protocol: 'responses', status: 'complete', session, started, ended: started + 110 };
+  const terminal = { id: 'resp_current', output: [], usage: { output_tokens: 1 } };
+  writeFileSync(path, received.join('\n'));
+  expect(await recoverCodexOutput({ ...call, reply: JSON.stringify(terminal) }, home)).toEqual([assistant]);
+  expect(await recoverCodexOutput({ ...call, reply: JSON.stringify({ ...terminal, id: 'resp_other' }) }, home)).toEqual([]);
+  expect(await recoverCodexOutput({ ...call, reply: JSON.stringify({ ...terminal, output: [assistant] }) }, home)).toEqual([]);
+  received.splice(4, 0, record('token_usage_record', 95, { thread_id: session, response_id: 'resp_overlap' }));
+  writeFileSync(path, received.join('\n'));
+  expect(await recoverCodexOutput({ ...call, reply: JSON.stringify(terminal) }, home)).toEqual([]);
+});
 test('two concurrent calls survive stop, individual runs retain the exact draft sent', async () => {
   expect((await fetch(service.url + 'api/list')).status).toBe(401);
   const base = { model: 'mock', messages: [{ role: 'user', content: 'original' }], stream: false };
@@ -68,7 +98,7 @@ test('two concurrent calls survive stop, individual runs retain the exact draft 
   await onRequest(base, ctx());
   const scope = (await api('capture-scope'))[1];
   expect(scope.scope).toEqual({ agents: ['alpha-client'] });
-  expect(scope.choices.agents).toEqual(['alpha-client', 'claude', 'codex', 'z-client']);
+  expect(scope.choices.agents).toEqual(['alpha-client', 'claude', 'codex']);
   expect((await api('list'))[1].calls).toHaveLength(0);
   await api('recording', { enabled: true });
   const a = ctx(),
@@ -84,7 +114,7 @@ test('two concurrent calls survive stop, individual runs retain the exact draft 
   await onResponse({ choices: [{ message: { content: 'observed' } }] }, { ...a, success: true });
   const calls = (await api('list'))[1].calls;
   expect(calls).toHaveLength(2);
-  expect(calls.find((x) => x.id === b.state.traceId).status).toBe('incomplete');
+  expect(calls.find((x) => x.id === b.state.traceId).status).toBe('checking');
   expect(calls[0].last_role).toBe('user');
   expect(calls[0].last_preview).toBe('original');
   const edited = structuredClone(base);
@@ -141,6 +171,32 @@ test('two concurrent calls survive stop, individual runs retain the exact draft 
   expect((await api('list?type=repeater&q=original'))[1].calls[0].id).toBe(oldRun);
   expect(seen.every((r) => r.name === 'd-message/1')).toBe(true);
 });
+test('capture candidates use the gateway catalog and preserve manual additions and removals', async () => {
+  const { gatewayAgents } = await import('../agent-catalog.js');
+  const db = storage();
+  const previous = (await api('capture-scope'))[1];
+  db.query("INSERT INTO capture_options VALUES ('agent','old-observed-client')").run();
+  try {
+    expect((await api('capture-scope'))[1].choices.agents).not.toContain('old-observed-client');
+    const [code, configured] = await api('capture-scope', {
+      agents: ['manual-example'], add: ['manual-example'], remove: ['codex'],
+    });
+    expect(code).toBe(200);
+    expect(configured.scope.agents).toEqual(['manual-example']);
+    expect(configured.choices.agents).toEqual(['alpha-client', 'claude', 'manual-example']);
+    await gatewayAgents(mock.url.href)();
+    expect((await api('capture-scope'))[1].choices.agents).toEqual(configured.choices.agents);
+    const [, deleted] = await api('capture-scope', { agents: [], remove: ['manual-example'] });
+    expect(deleted.scope.agents).toEqual([]);
+    expect(deleted.choices.agents).not.toContain('manual-example');
+    const [, restored] = await api('capture-scope', { ...previous.scope, add: ['codex'] });
+    expect(restored.choices.agents).toContain('codex');
+  } finally {
+    db.query("DELETE FROM capture_options WHERE value IN ('old-observed-client','manual-example','codex') AND kind IN ('agent','manual_agent','hidden_agent')").run();
+    await api('capture-scope', previous.scope);
+  }
+});
+
 test('split SSE tool arguments and usage, reject incomplete stream', async () => {
   const lines = [
     {
@@ -491,6 +547,13 @@ test('persistent tabs isolate runs, reject stale saves and keep Trace history af
   expect(req('open', { ref }).tab.id).toBe(a.id);
   const copy = req('duplicate', { id: a.id }).tab;
   expect(copy.id).not.toBe(a.id);
+  req('run-view', { id: copy.id, tab: 'Reply', raw: true });
+  expect(req('workspace').tab).toMatchObject({
+    id: copy.id,
+    revision: copy.revision,
+    run_view: { tab: 'Reply', raw: true },
+  });
+  expect(req('workspace').tab.state).toEqual(copy.state);
   const state = {
     ...copy.state,
     tab: 'Changes',
@@ -531,6 +594,7 @@ test('persistent tabs isolate runs, reject stale saves and keep Trace history af
   expect(req('workspace').tab.id).toBe(a.id);
   const reopened = req('select', { id: copy.id }).tab;
   expect(reopened.selected_run).toBe(run);
+  expect(reopened.run_view).toEqual({ tab: 'Reply', raw: true });
   expect(reopened.state).toEqual(state);
   expect(() => req('delete', { id: copy.id })).toThrow('Confirm');
   const after = req('delete', { id: copy.id, confirmed: true });
@@ -755,7 +819,6 @@ test('native SSE preserves content, thinking, tool inputs, outcome and usage; re
 
 test('session tree API indexes requests by session ID and rejects requests without one', async () => {
   const { recordState } = await import('../trace-api.js');
-  const { backfillChains } = await import('../session-tree.js');
   recordState('start', { agents: ['codex', 'claude', 'artex'] });
   const msg = (role, text) => ({ type: 'message', role, content: [{ type: 'input_text', text }] });
   const turn = async (agent, protocol, session, body) => {
@@ -776,25 +839,127 @@ test('session tree API indexes requests by session ID and rejects requests witho
   });
   await turn('artex', 'chat', '', { model: 'm', messages: [{ role: 'user', content: 'x' }] });
   recordState('stop');
-  expect(backfillChains(50)).toBeGreaterThanOrEqual(3);
   const server = startService({ port, uiKey }, { upstream: mock.url.href, restoreMcp: false });
   try {
+    const listed = (await api('list?type=capture'))[1].calls;
+    const group = listed.find((r) => r.entry_type === 'session' && r.session === 'tree-thread');
+    expect(group).toMatchObject({ agent: 'codex', requests: 3, title: 'task', status: 'pending' });
+    storage().query('INSERT INTO settings VALUES (?,?)').run('ui_detail_tab:' + group.id, 'Full JSON');
+    expect((await api('calls/' + first))[1].detail_view).toEqual({ tab: 'Request', requestRaw: true });
+    const view = { tab: 'Reply', requestRaw: true, replyRaw: false };
+    expect((await api('view-preferences', { record: first, ...view }))[0]).toBe(200);
+    expect((await api('calls/' + next))[1].detail_view).toEqual(view);
+    expect(group.latest.id).toBe(compacted);
+    expect(group.latest).not.toHaveProperty('request');
+    expect(group).not.toHaveProperty('nodes');
+    expect(listed.some((r) => r.agent === 'artex' && r.entry_type === 'capture')).toBe(true);
+    const chain = storage().query('SELECT 1 FROM call_chain WHERE call_id=?');
+    expect(chain.get(first)).toBeNull();
+    const found = (await api('list?q=' + encodeURIComponent('request:summary')))[1].calls;
+    expect(found.filter((r) => r.session === 'tree-thread').map((r) => r.matches.map((m) => m.id))).toEqual([[compacted]]);
+    expect(chain.get(first)).toBeNull();
     const [code, tree] = await api('sessions/tree?agent=codex&session=tree-thread');
-    expect(code).toBe(200);
+    expect({ code, error: tree.error }).toEqual({ code: 200, error: undefined });
     expect(tree.nodes.map((n) => [n.id, n.kind, n.parent, n.main])).toEqual([
       [first, 'root', null, true],
       [next, 'turn', first, true],
       [compacted, 'compacted', next, true],
     ]);
+    expect(chain.get(first)).toBeTruthy();
     expect((await api('sessions/tree?agent=artex&session='))[0]).toBe(400);
-    const listed = (await api('list?type=capture'))[1].calls;
-    const group = listed.find((r) => r.entry_type === 'session' && r.session === 'tree-thread');
-    expect(group).toMatchObject({ agent: 'codex', requests: 3, title: 'task', status: 'pending' });
-    expect(group.latest.id).toBe(compacted);
-    expect(listed.some((r) => r.agent === 'artex' && r.entry_type === 'capture')).toBe(true);
-    const found = (await api('list?q=' + encodeURIComponent('request:summary')))[1].calls;
-    expect(found.filter((r) => r.session === 'tree-thread').map((r) => r.matches.map((m) => m.id))).toEqual([[compacted]]);
   } finally {
+    await server.stop(true);
+  }
+});
+
+test('Trace pages session groups after sorting and fetches summaries for the selected page', async () => {
+  const db = storage();
+  const server = startService({ port, uiKey }, { upstream: mock.url.href, restoreMcp: false });
+  const insert = db.query(`INSERT INTO calls(id,agent,session,model,started,ended,status,owner,request,
+    last_role,last_preview,preview_version) VALUES(?,'page-test',?,'m',?,?,'complete',?,'{}','user',?,1)`);
+  const firstTime = Date.now() + 10_000;
+  db.transaction(() => {
+    for (let i = 0; i < 102; i++)
+      insert.run(crypto.randomUUID(), 'page-' + i, firstTime + i, firstTime + i, process.pid, 'page ' + i);
+    insert.run(crypto.randomUUID(), 'page-0', firstTime + 200, firstTime + 200, process.pid, 'latest');
+  })();
+  try {
+    const page = (await api('list?type=capture'))[1];
+    expect(page.calls).toHaveLength(100);
+    expect(page.more).toBe(true);
+    expect(page.calls[0]).toMatchObject({
+      session: 'page-0', requests: 2, title: 'page 0', latest: { last_preview: 'latest' },
+    });
+    const nextPage = (await api('list?type=capture&offset=100'))[1];
+    expect(nextPage.total).toBe(page.total);
+    expect(nextPage.calls.slice(0, 2).map((row) => row.session)).toEqual(['page-2', 'page-1']);
+    expect(nextPage.calls.some((row) => row.session === 'page-0')).toBe(false);
+    const beyond = (await api('list?type=capture&offset=1000000'))[1];
+    expect(beyond).toMatchObject({ calls: [], total: page.total, more: false });
+  } finally {
+    db.query("DELETE FROM calls WHERE agent='page-test'").run();
+    await server.stop(true);
+  }
+});
+
+test('session history pages newest first and exposes request and reply separately', async () => {
+  const { startCall, endCall, setRecording, saveScope } = await import('../store.js');
+  const server = startService({ port, uiKey }, { upstream: mock.url.href, restoreMcp: false });
+  const db = storage();
+  const session = 'paged-thread';
+  const ids = [];
+  const previousScope = db.query("SELECT value FROM settings WHERE key='capture_scope'").get();
+  const previousRecording = db.query("SELECT value FROM settings WHERE key='recording'").get();
+  const tool = { id: 'cross-page', type: 'function', function: { name: 'lookup', arguments: '{}' } };
+  const messages = [
+    { role: 'assistant', tool_calls: [tool] },
+    ...Array.from({ length: 83 }, (_, i) => ({ role: 'user', content: 'earlier ' + i })),
+    { role: 'tool', tool_call_id: tool.id, content: 'tool result' },
+    { role: 'user', content: 'turn 44' },
+  ];
+  try {
+    saveScope(db, { agents: ['page-agent'] });
+    setRecording(true, db);
+    for (let i = 0; i < 45; i++) {
+      const history = i === 44 ? messages : [{ role: 'user', content: 'turn ' + i }];
+      const id = startCall({ model: 'fixture', messages: history }, session, 'page-agent');
+      endCall(id, { choices: [{ message: { role: 'assistant', content: 'reply ' + i } }] }, true);
+      ids.push(id);
+    }
+    const path = 'sessions/tree?agent=page-agent&session=paged-thread&page=1';
+    const [code, first] = await api(path);
+    expect({ code, error: first.error }).toEqual({ code: 200, error: undefined });
+    expect(first.nodes.map((node) => node.id)).toEqual(ids.slice(5).reverse());
+    const [, older] = await api(path + '&before=' + first.next);
+    expect(older.nodes.map((node) => node.id)).toEqual(ids.slice(0, 5).reverse());
+    expect(older.next).toBeNull();
+    expect((await api(path + '&focus=' + ids[0]))[1].node.id).toBe(ids[0]);
+
+    const event = 'calls/' + ids.at(-1) + '?part=';
+    expect((await api(event + 'meta'))[1]).not.toHaveProperty('request');
+    expect((await api(event + 'meta'))[1]).not.toHaveProperty('reply');
+    const [, request] = await api(event + 'request');
+    expect(request.request).toContain('turn 44');
+    expect(request).not.toHaveProperty('reply');
+    const [, reply] = await api(event + 'reply');
+    expect(reply.reply).toContain('reply 44');
+    expect(reply).not.toHaveProperty('request');
+
+    const [, newest] = await api(event + 'history');
+    expect(newest.messages).toEqual(messages.slice(-40));
+    expect(newest.linked).toEqual([[tool.id, tool]]);
+    expect(newest).not.toHaveProperty('request');
+    const [, prior] = await api(event + 'history&before=' + newest.next);
+    expect(prior.messages).toEqual(messages.slice(6, 46));
+    const [, oldest] = await api(event + 'history&before=' + prior.next);
+    expect(oldest.messages).toEqual(messages.slice(0, 6));
+    expect(oldest.next).toBeNull();
+  } finally {
+    db.query("DELETE FROM calls WHERE agent='page-agent'").run();
+    for (const [key, old] of [['capture_scope', previousScope], ['recording', previousRecording]]) {
+      if (old) db.query('INSERT OR REPLACE INTO settings VALUES (?,?)').run(key, old.value);
+      else db.query('DELETE FROM settings WHERE key=?').run(key);
+    }
     await server.stop(true);
   }
 });
@@ -954,4 +1119,310 @@ test('old captures and replay snapshots gain independent summaries without rewri
     .toEqual({request:body('one'),reply,last_preview:'one · done',final_preview:'Ready'});
   expect(db.query('SELECT last_preview,final_preview FROM runs WHERE id=?').get(run))
     .toEqual({last_preview:'two · done',final_preview:'Ready'});
+});
+
+test('continuations bind the selected run, require a reviewed file and deliver the saved answer once', async () => {
+  const { startCall, endCall, setRecording, saveScope } = await import('../store.js');
+  const { createContinuations } = await import('../continue-agent.js');
+  const { nativeLaunch } = await import('../continue-launch.js');
+  const { writeFileSync, realpathSync } = await import('node:fs');
+  const db = storage(),
+    dir = realpathSync(dataDir);
+  const file = join(dir, 'approved.txt');
+  writeFileSync(file, 'example');
+  saveScope(db, { agents: 'all' });
+  setRecording(true);
+  const params = { type: 'object', properties: { file_path: { type: 'string' } } };
+  const q = {
+    model: 'test',
+    max_tokens: 200,
+    messages: [{ role: 'user', content: 'original' }],
+    tools: [{ name: 'Read', input_schema: params }],
+  };
+  const reply = {
+    type: 'message',
+    role: 'assistant',
+    id: 'msg_saved',
+    model: 'test',
+    stop_reason: 'tool_use',
+    content: [{ type: 'tool_use', id: 'toolu_1', name: 'Read', input: { file_path: file } }],
+  };
+  const call = startCall(q, '', 'claude', 'anthropic');
+  endCall(call, reply, true, 'anthropic');
+  const exp = crypto.randomUUID(),
+    run = crypto.randomUUID(),
+    key = crypto.randomUUID();
+  const edited = { ...q, max_tokens: 800, messages: [{ role: 'user', content: 'edited' }] };
+  db.query('INSERT INTO experiments VALUES(?,?,0,?)').run(exp, call, JSON.stringify(edited));
+  db.query(
+    "INSERT INTO runs(id,experiment_id,kind,started,status,owner,reply) VALUES(?,?,'send',0,'complete',0,?)",
+  ).run(run, exp, JSON.stringify(reply));
+  let opens = 0,
+    modelCalls = 0,
+    wire,
+    wireHeaders;
+  const local = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(req) {
+      modelCalls++;
+      wire = await req.json();
+      wireHeaders = req.headers;
+      return Response.json({ ok: true });
+    },
+  });
+  try {
+    const chats = createContinuations(db, {
+      port: port,
+      upstream: local.url,
+      uiKey,
+      refreshAgents: async () => {},
+      launch: async () => {
+        opens++;
+      },
+      detect: () => '/bin/true',
+      platform: 'darwin',
+    });
+    const opts = await chats.options(run);
+    expect(opts.original).toBe('claude');
+    expect(opts.read).toBe(file);
+    expect(opts.targets.find((t) => t.id === 'claude').reason).toBe('');
+    db.query('UPDATE calls SET agent=? WHERE id=?').run('artex', call);
+    try {
+      const other = await chats.options(run);
+      expect(other.original).toBe('artex');
+      expect(other.targets.every(({ id }) => ['claude', 'codex', 'dsh'].includes(id))).toBe(true);
+      await expect(chats.start(run, { target: 'artex', key })).rejects.toThrow('Unsupported continuation target');
+      await expect(chats.start(run, { target: 'artex', reopen: key })).rejects.toThrow('Unsupported continuation target');
+    } finally {
+      db.query('UPDATE calls SET agent=? WHERE id=?').run('claude', call);
+    }
+    await expect(chats.start(run, { target: 'claude', key })).rejects.toThrow('Review');
+    await expect(chats.start(run, { target: 'codex', key, approvedFile: file })).rejects.toThrow(
+      'protocol',
+    );
+    await Promise.all(
+      [1, 2].map(() => chats.start(run, { target: 'claude', key, approvedFile: file })),
+    );
+    expect(opens).toBe(1);
+    const chat = db.query('select * from agent_chats where id=?').get(key);
+    const spec = nativeLaunch({ ...chat, model: q.model, protocol: 'anthropic' }, '/bin/true', dir);
+    expect(spec.cmd.at(-1)).toBe(chat.marker);
+    expect(spec.env.ANTHROPIC_BASE_URL).not.toContain(chat.access_key);
+    const url = chat.base + '/v1/messages';
+    const ask = (b, headers) =>
+      chats.serve(
+        new Request(url, { method: 'POST', body: JSON.stringify(b), headers }),
+        new URL(url).pathname,
+      );
+    const h = { 'x-api-key': spec.env.ANTHROPIC_API_KEY };
+    const seed = { ...q, messages: [{ role: 'user', content: chat.marker }] };
+    expect((await ask(seed, {})).status).toBe(403);
+    expect((await ask(seed, { ...h, origin: 'null' })).status).toBe(403);
+    const answered = await ask(seed, h);
+    expect(await answered.json()).toEqual(reply);
+    expect(modelCalls).toBe(0);
+    expect((await ask(seed, h)).status).toBe(409);
+    const tail = [
+      { role: 'assistant', content: reply.content },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'example' }],
+      },
+    ];
+    expect((await ask({ ...seed, messages: [...seed.messages, ...tail] }, h)).status).toBe(200);
+    expect(wire.messages).toEqual([...edited.messages, ...tail]);
+    expect(wire.max_tokens).toBe(800);
+    expect(modelCalls).toBe(1);
+    expect(wireHeaders.get('x-api-key')).toBe('magpie-d-message');
+    expect((await chats.options(run)).targets.find((t) => t.id === 'claude').reopen).toBe(key);
+    expect(await chats.start(run, { target: 'claude', reopen: key })).toEqual({
+      id: key,
+      state: 'reopened',
+    });
+    expect(opens).toBe(2);
+    await expect(chats.start(run, { target: 'dsh', reopen: key })).rejects.toThrow('reopened');
+    db.query('DELETE FROM runs WHERE id=?').run(run);
+    expect((await ask(seed, h)).status).toBe(410);
+  } finally {
+    local.stop(true);
+  }
+});
+
+test('DSH resends the edited user input in the existing Host branch and retries with the same request ID', async () => {
+  const { startCall, endCall, saveScope, setRecording } = await import('../store.js');
+  const { createContinuations } = await import('../continue-agent.js');
+  const { locateDshPrompt } = await import('../dsh-prompt.js');
+  const db = storage(),
+    run = crypto.randomUUID(),
+    exp = crypto.randomUUID(),
+    key = crypto.randomUUID();
+  saveScope(db, { agents: 'all' });
+  setRecording(true);
+  const original = {
+    model: 'm',
+    messages: [
+      { role: 'user', content: 'Original question' },
+      { role: 'user', content: 'DSH runtime context' },
+    ],
+  };
+  const edited = structuredClone(original);
+  edited.messages[0].content = 'Edited question';
+  const answer = { choices: [{ message: { role: 'assistant', content: 'Source receipt' } }] };
+  const call = startCall(original, '', 'dsh', 'chat');
+  endCall(call, answer, true, 'chat');
+  db.query('INSERT INTO experiments VALUES(?,?,0,?)').run(exp, call, JSON.stringify(edited));
+  const replayAnswer = {
+    choices: [
+      { message: { role: 'assistant', content: 'This saved answer must never be delivered.' } },
+    ],
+  };
+  db.query(
+    "INSERT INTO runs(id,experiment_id,kind,started,status,owner,reply) VALUES(?,?,'send',0,'complete',0,?)",
+  ).run(run, exp, JSON.stringify(replayAnswer));
+  const root = join(dataDir, 'dsh-test-sessions');
+  const folder = join(root, 'project', 'session-parent');
+  mkdirSync(folder, { recursive: true });
+  const events = [
+    { type: 'session', id: 'session-parent' },
+    { type: 'permission/preset', seq: 0, data: {} },
+    {
+      type: 'agent/inbox/spliced',
+      seq: 1,
+      data: { inserted: [{ id: 'q', source: { kind: 'user' } }] },
+    },
+    { type: 'turn/start', seq: 2, data: {} },
+    {
+      type: 'user/message',
+      seq: 3,
+      data: {
+        id: 'q',
+        source: { kind: 'user' },
+        content: [{ type: 'text', text: 'Original question' }],
+      },
+    },
+    {
+      type: 'user/message',
+      seq: 4,
+      data: {
+        source: { kind: 'runtime-context' },
+        content: [{ type: 'text', text: 'DSH runtime context' }],
+      },
+    },
+    {
+      type: 'assistant/message',
+      seq: 5,
+      data: { message: { content: [{ type: 'text', text: 'Source receipt' }] } },
+    },
+    { type: 'turn/end', seq: 6, data: {} },
+    // DSH writes an ordinary end-seed marker when it reopens this session.
+    { type: 'session/end-seed', seq: 7, data: {} },
+  ];
+  writeFileSync(
+    join(folder, 'session.v4.jsonl.zstd'),
+    Buffer.concat(events.map((e) => Bun.zstdCompressSync(JSON.stringify(e) + '\n'))),
+  );
+  const forks = [],
+    prompts = [];
+  const host = {
+    client: () => ({
+      origin: 'http://127.0.0.1:9080',
+      fork: async (value) => {
+        forks.push(value);
+        return { sessionId: 'session-child' };
+      },
+      prompt: async (value) => {
+        prompts.push(value);
+        if (prompts.length === 1) throw Error('Disconnected');
+        return { accepted: true };
+      },
+    }),
+  };
+  const chats = createContinuations(db, {
+    uiKey,
+    port,
+    upstream: mock.url,
+    refreshAgents: async () => {},
+    host,
+    locateDsh: (r) => locateDshPrompt(r, root),
+    launch: () => {
+      throw Error('Unexpected native launch');
+    },
+  });
+  expect((await chats.options(run)).targets.find((t) => t.id === 'dsh').reason).toBe('');
+  await expect(chats.start(run, { target: 'dsh', key })).rejects.toThrow('Disconnected');
+  const [a, b] = await Promise.all([1, 2].map(() => chats.start(run, { target: 'dsh', key })));
+  expect(a).toEqual(b);
+  expect(a.sessionId).toBe('session-child');
+  expect(forks).toEqual([{ sessionId: 'session-parent', atSeq: 0 }]);
+  expect(prompts[0]).toEqual({
+    sessionId: 'session-child',
+    requestId: key,
+    mode: 'queue',
+    content: [{ type: 'text', text: 'Edited question' }],
+  });
+  expect(prompts[1]).toEqual(prompts[0]);
+  expect(await chats.start(run, { target: 'dsh', key })).toEqual(a);
+  expect(prompts.length).toBe(2);
+  const contextEdit = structuredClone(original);
+  contextEdit.messages[1].content = 'Edited runtime context';
+  const row = {
+    agent: 'dsh',
+    request: JSON.stringify(original),
+    source_reply: JSON.stringify(answer),
+  };
+  const contextExperiment = crypto.randomUUID(),
+    contextRun = crypto.randomUUID();
+  db.query('INSERT INTO experiments VALUES(?,?,0,?)').run(
+    contextExperiment,
+    call,
+    JSON.stringify(contextEdit),
+  );
+  db.query(
+    "INSERT INTO runs(id,experiment_id,kind,started,status,owner,reply) VALUES(?,?,'send',0,'complete',0,?)",
+  ).run(contextRun, contextExperiment, JSON.stringify(replayAnswer));
+  await chats.start(contextRun, { target: 'dsh', key: crypto.randomUUID() });
+  expect(forks.at(-1)).toEqual({ sessionId: 'session-parent', atSeq: 0 });
+  expect(prompts.at(-1).content).toEqual([{ type: 'text', text: 'Edited runtime context' }]);
+  const unlogged = structuredClone(original);
+  unlogged.messages[1].content = 'Adapter-supplied context';
+  expect(
+    await locateDshPrompt(
+      { ...row, request: JSON.stringify(unlogged), body: JSON.stringify(contextEdit) },
+      root,
+    ),
+  ).toEqual({ sessionId: 'session-parent', atSeq: 0, content: prompts.at(-1).content });
+  // A fresh tab has no Run to reference. Send the editor contents without
+  // creating a synthetic run, and keep the action id bound to this draft.
+  const fresh = startCall(original, '', 'dsh', 'chat');
+  endCall(fresh, answer, true, 'chat');
+  const ref = 'capture/' + fresh;
+  const freshKey = crypto.randomUUID();
+  expect((await chats.options(ref)).targets).toContainEqual({id:'dsh',reason:'',reopen:null});
+  const unsent = structuredClone(original);
+  unsent.messages[0].content = 'Unsent DSH draft';
+  const direct = {target:'dsh', key:freshKey, request:unsent};
+  const accepted = await chats.start(ref,direct);
+  expect(await chats.start(ref,direct)).toEqual(accepted);
+  expect(prompts.at(-1).content).toEqual([{type:'text',text:'Unsent DSH draft'}]);
+  await expect(chats.start(ref,{...direct, request:original})).rejects.toThrow('different request');
+  expect(db.query('SELECT count(*) AS n FROM experiments WHERE call_id=?').get(fresh).n).toBe(0);
+  const duplicate = join(root, 'other', 'session-other');
+  mkdirSync(duplicate, { recursive: true });
+  const duplicateFile = join(duplicate, 'session.v4.jsonl');
+  const copied = events
+    .map((e) => JSON.stringify(e.type === 'session' ? { ...e, id: 'session-other' } : e))
+    .join('\n');
+  writeFileSync(
+    duplicateFile,
+    copied + '\n' + JSON.stringify({ type: 'session/end-seed', seq: 8, data: { inherited: true } }),
+  );
+  expect((await locateDshPrompt({ ...row, body: row.request }, root)).sessionId).toBe(
+    'session-parent',
+  );
+  writeFileSync(duplicateFile, copied);
+  await expect(chats.start(run, { target: 'dsh', key: crypto.randomUUID() })).rejects.toThrow(
+    'uniquely',
+  );
+  expect(forks.length).toBe(3);
 });

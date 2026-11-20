@@ -1,5 +1,6 @@
-import { requestEntries, endpointFor } from './ui/protocols.js';
-import { messagePreview } from './ui/messages.js';
+import { endpointFor } from './ui/protocols.js';
+import { requestPreview } from './ui/messages.js';
+import { finalPreview } from './ui/response-items.js';
 import { Database } from 'bun:sqlite';
 import { mkdirSync, chmodSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -37,6 +38,9 @@ export function storage() {
     CREATE TABLE IF NOT EXISTS runs(
       id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL REFERENCES experiments(id), kind TEXT NOT NULL,
       started INTEGER NOT NULL, ended INTEGER, status TEXT NOT NULL, reply TEXT, error TEXT, owner INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS replay_jobs(
+      run_id TEXT PRIMARY KEY, destination TEXT NOT NULL, owner INTEGER);
+    CREATE INDEX IF NOT EXISTS replay_jobs_owner ON replay_jobs(owner);
     CREATE TABLE IF NOT EXISTS repeater_tabs(
       id TEXT PRIMARY KEY, call_id TEXT NOT NULL REFERENCES calls(id), source_ref TEXT NOT NULL,
       name TEXT NOT NULL, closed INTEGER, revision TEXT NOT NULL, state TEXT NOT NULL,
@@ -60,14 +64,6 @@ export function storage() {
     if (!columns.includes('last_role')) db.exec('ALTER TABLE calls ADD COLUMN last_role TEXT');
     if (!columns.includes('last_preview'))
       db.exec('ALTER TABLE calls ADD COLUMN last_preview TEXT');
-    const refreshPreviews = !db.query("SELECT 1 FROM settings WHERE key='preview_en_v1'").get();
-    const update = db.query('UPDATE calls SET last_role=?,last_preview=? WHERE id=?');
-    for (const row of db
-      .query('SELECT id,request,protocol FROM calls WHERE last_role IS NULL OR ?')
-      .iterate(Number(refreshPreviews))) {
-      const msg = requestEntries(row.protocol, JSON.parse(row.request)).at(-1)?.message;
-      update.run(msg?.role || '', messagePreview(msg), row.id);
-    }
     const runColumns = db
       .query('PRAGMA table_info(runs)')
       .all()
@@ -76,27 +72,45 @@ export function storage() {
       db.exec(
         'ALTER TABLE runs ADD COLUMN tab_id TEXT REFERENCES repeater_tabs(id) ON DELETE SET NULL',
       );
+    if (!runColumns.includes('failure')) db.exec('ALTER TABLE runs ADD COLUMN failure TEXT');
     if (!runColumns.includes('model')) db.exec('ALTER TABLE runs ADD COLUMN model TEXT');
+    db.exec("CREATE INDEX IF NOT EXISTS runs_inflight ON runs(owner) WHERE status='running'");
     db.exec('CREATE INDEX IF NOT EXISTS runs_tab ON runs(tab_id, started)');
     if (!runColumns.includes('last_role')) db.exec('ALTER TABLE runs ADD COLUMN last_role TEXT');
     if (!runColumns.includes('last_preview'))
       db.exec('ALTER TABLE runs ADD COLUMN last_preview TEXT');
-    const updateRun = db.query('UPDATE runs SET last_role=?,last_preview=? WHERE id=?');
-    for (const row of db
-      .query(
-        `SELECT r.id,c.protocol,
-      CASE WHEN r.kind='baseline' THEN c.request ELSE e.body END AS request
-      FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id
-      WHERE r.last_role IS NULL OR ?`,
-      )
-      .iterate(Number(refreshPreviews))) {
-      const msg = requestEntries(row.protocol, JSON.parse(row.request)).at(-1)?.message;
-      updateRun.run(msg?.role || '', messagePreview(msg), row.id);
+    for (const [table, names] of [['calls', columns], ['runs', runColumns]]) {
+      if (!names.includes('final_preview')) db.exec('ALTER TABLE ' + table + ' ADD COLUMN final_preview TEXT');
+      if (!names.includes('preview_version')) db.exec('ALTER TABLE ' + table + ' ADD COLUMN preview_version INTEGER NOT NULL DEFAULT 0');
+      db.exec('CREATE INDEX IF NOT EXISTS ' + table + '_old_previews ON ' + table + '(preview_version) WHERE preview_version=0');
     }
-    if (refreshPreviews) db.query("INSERT INTO settings VALUES ('preview_en_v1','1')").run();
   }).immediate();
   shared = db;
   return db;
+}
+
+// Decode historical bodies outside the writer transaction. A completion racing the
+// backfill keeps its own response preview and the row is retried on the next pass.
+export function backfillPreviews(limit = 12, db = storage()) {
+  let remaining = limit;
+  for (const table of ['calls', 'runs']) {
+    const rows = db.query(table === 'calls'
+      ? 'SELECT id,protocol,request,reply,ended FROM calls WHERE preview_version=0 ORDER BY rowid DESC LIMIT ?'
+      : `SELECT r.id,c.protocol,CASE WHEN r.kind='baseline' THEN c.request ELSE e.body END AS request,
+          r.reply,r.ended FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id
+          WHERE r.preview_version=0 ORDER BY r.rowid DESC LIMIT ?`).all(remaining);
+    const updates = rows.map(row => {
+      const summary = requestPreview(row.protocol, JSON.parse(row.request));
+      return [summary.role, summary.text, finalPreview(JSON.parse(row.reply)), row.id, row.ended];
+    });
+    if (updates.length) {
+      const update = db.query('UPDATE ' + table + ' SET last_role=?,last_preview=?,final_preview=?,preview_version=1 WHERE id=? AND ended IS ? AND preview_version=0');
+      db.transaction(() => { for (const values of updates) update.run(...values); }).immediate();
+    }
+    remaining -= rows.length;
+    if (!remaining) break;
+  }
+  return limit - remaining;
 }
 
 export function clearedThrough(db) {
@@ -116,7 +130,7 @@ export function clearHistory(db) {
       const cursor = captureCursor(db);
       db.query("DELETE FROM settings WHERE key='repeater_active'").run();
       db.exec(
-        'DELETE FROM repeat_keys; DELETE FROM runs; DELETE FROM repeater_tabs; DELETE FROM experiments; DELETE FROM call_chain; DELETE FROM calls;',
+        'DELETE FROM replay_jobs WHERE owner IS NULL; DELETE FROM repeat_keys; DELETE FROM runs; DELETE FROM repeater_tabs; DELETE FROM experiments; DELETE FROM call_chain; DELETE FROM calls;',
       );
       db.query("INSERT OR REPLACE INTO settings VALUES ('cleared_cursor',?)").run(String(cursor));
       return { clearedThrough: cursor };
@@ -163,10 +177,10 @@ export function startCall(body, session, agent, protocol = 'chat', path) {
       const scope = captureScope(db, true);
       if (scope.agents !== 'all' && !scope.agents.includes(agent)) return null;
       const id = crypto.randomUUID(),
-        last = requestEntries(protocol, body).at(-1)?.message;
+        last = requestPreview(protocol, body);
       db.query(
-        `INSERT INTO calls(rowid,id,session,agent,model,started,status,request,owner,last_role,last_preview,protocol,endpoint)
-      VALUES(?,?,?,?,?,?,'pending',?,?,?,?,?,?)`,
+        `INSERT INTO calls(rowid,id,session,agent,model,started,status,request,owner,last_role,last_preview,protocol,endpoint,preview_version)
+      VALUES(?,?,?,?,?,?,'pending',?,?,?,?,?,?,1)`,
       ).run(
         captureCursor(db) + 1,
         id,
@@ -176,8 +190,8 @@ export function startCall(body, session, agent, protocol = 'chat', path) {
         Date.now(),
         JSON.stringify(body),
         process.pid,
-        last?.role || '',
-        messagePreview(last),
+        last.role,
+        last.text,
         protocol,
         endpointFor(protocol, path),
       );
@@ -194,29 +208,51 @@ export function endCall(id, reply, success, protocol = 'chat') {
         : 'incomplete';
   storage()
     .query(
-      "UPDATE calls SET ended=?,status=?,reply=? WHERE id=? AND status IN ('pending','incomplete')",
+      "UPDATE calls SET ended=?,status=?,reply=?,final_preview=? WHERE id=? AND status IN ('pending','incomplete')",
     )
-    .run(Date.now(), status, reply == null ? null : JSON.stringify(reply), id);
+    .run(Date.now(), status, reply == null ? null : JSON.stringify(reply), finalPreview(reply), id);
 }
 
 export function reconcile() {
   const db = storage();
-  for (const table of ['calls', 'runs']) {
-    const pending = table === 'calls' ? 'pending' : 'running';
-    for (const row of db.query(`SELECT DISTINCT owner FROM ${table} WHERE status=?`).all(pending)) {
-      try {
-        process.kill(row.owner, 0);
-      } catch (e) {
-        if (e.code === 'ESRCH')
-          db.query(`UPDATE ${table} SET status='incomplete' WHERE status=? AND owner=?`).run(
-            pending,
-            row.owner,
-          );
-      }
-    }
+  for (const { owner } of db
+    .query("SELECT DISTINCT owner FROM calls WHERE status='pending'")
+    .all()) {
+    if (ownerExited(owner))
+      db.query("UPDATE calls SET status='incomplete' WHERE status='pending' AND owner=?").run(
+        owner,
+      );
   }
+  reconcileReplays(db);
   // Magpie expires outstanding hook state after 15 minutes. A late callback can still finalize the row.
   db.query("UPDATE calls SET status='incomplete' WHERE status='pending' AND started<?").run(
     Date.now() - 16 * 60 * 1000,
   );
+}
+
+function ownerExited(owner) {
+  try {
+    process.kill(owner, 0);
+    return false;
+  } catch (error) {
+    return error.code === 'ESRCH';
+  }
+}
+
+export function reconcileReplays(db) {
+  const owners = db
+    .query(
+      `SELECT owner FROM replay_jobs WHERE owner IS NOT NULL
+    UNION SELECT owner FROM runs WHERE status='running'`,
+    )
+    .all();
+  for (const { owner } of owners) {
+    if (!ownerExited(owner)) continue;
+    db.transaction(() => {
+      db.query(
+        "UPDATE runs SET status='interrupted',ended=?,error=? WHERE status='running' AND owner=?",
+      ).run(Date.now(), 'Replay host stopped before the response was saved.', owner);
+      db.query('DELETE FROM replay_jobs WHERE owner=?').run(owner);
+    }).immediate();
+  }
 }

@@ -1,3 +1,4 @@
+import { toolLookup, phaseLabel } from './response-items.js';
 import {
   protocolNames,
   requestEntries,
@@ -20,17 +21,38 @@ import {
   jsonTree,
   showText,
   messageCard,
-  toolLookup,
   sectionTitle,
   pretty,
 } from './views.js';
 import { draftWriter } from './tab-save.js';
-import { searchConditions, searchHits, pointer } from './search.js';
+import { searchConditions, rankedHits, pointer } from './search.js';
 import { filterBox } from './filter-box.js';
 import { changesView } from './changes.js';
-import { laneLayout, sessionRowId } from './session-graph.js';
+import { activeBranch, laneLayout, sessionRowId } from './session-graph.js';
 import { modelPicker } from './model-picker.js';
 const $ = (id) => document.getElementById(id);
+// The launcher has already paired this frame. After navigating to the page
+// service, ask Magpie for its appearance again and follow live theme changes.
+if (window.parent !== window) {
+  const requestId = 'd-message-appearance';
+  const colors = ['bg', 'card', 'fg', 'fg-2', 'line', 'accent', 'accent-soft', 'accent-fg', 'green', 'red', 'amber'];
+  window.addEventListener('message', (event) => {
+    if (event.source !== window.parent || event.data?.magpie !== 1) return;
+    const msg = event.data;
+    const theme = msg.event === 'theme' ? msg.data : msg.id === requestId ? msg.result : null;
+    if (typeof theme?.dark !== 'boolean') return;
+    const root = document.documentElement;
+    root.dataset.theme = theme.dark ? 'dark' : 'light';
+    for (const name of [...colors, 'font', 'code']) {
+      const value = theme.tokens?.[name];
+      const property = colors.includes(name) ? 'color' : 'font-family';
+      if (typeof value === 'string' && CSS.supports(property, value))
+        root.style.setProperty('--magpie-' + name, value);
+      else root.style.removeProperty('--magpie-' + name);
+    }
+  });
+  window.parent.postMessage({ magpie: 1, method: 'theme', id: requestId }, '*');
+}
 const entryParams = new URLSearchParams(location.hash.slice(1));
 const entryKey = entryParams.get('access');
 const access =
@@ -51,7 +73,10 @@ const statusName = {
   complete: 'Complete',
   pending: 'Pending',
   incomplete: 'Incomplete',
-  running: 'Sending',
+  queued: 'Queued',
+  running: 'Running',
+  canceled: 'Canceled',
+  interrupted: 'Interrupted',
   failed: 'Failed',
   draft: 'Saved draft',
 };
@@ -206,6 +231,7 @@ function paintMcp(config) {
   $('mcpEnabled').checked = config.enabled;
   $('mcpPort').value = config.port;
   $('mcpUrl').value = config.url;
+  $('mcpStatus').dataset.state = config.error ? 'error' : config.listening ? 'on' : 'off';
   $('mcpStatus').textContent =
     config.error || (config.listening ? 'Listening on 127.0.0.1' : 'Listener off');
   $('mcpCopy').disabled = !config.listening;
@@ -405,11 +431,30 @@ function inspect(scroll = false) {
       box.scrollTop = box.lastElementChild.offsetTop - box.offsetTop;
   }
 }
+function queuedMessage(id, refresh) {
+  const box = el('div', '', 'hint');
+  box.append(
+    el('p', 'Waiting for a replay slot…'),
+    button(
+      'Cancel queued run',
+      invoke(async () => {
+        try {
+          await api('cancel/' + id, {});
+        } finally {
+          await refresh();
+        }
+      }),
+    ),
+  );
+  return box;
+}
 function noReply() {
+  if (selected.status === 'queued') return queuedMessage(selected.id, list);
   return el(
     'p',
     selected.error ||
       {
+        canceled: 'Canceled before sending.',
         pending: 'Waiting for a response…',
         running: 'Waiting for a response…',
         incomplete:
@@ -424,9 +469,9 @@ function noReply() {
 }
 const trees = new Map();
 let activeGroup = null,
-  mainPathOnly = false;
+  activeOnly = false;
 let rowIndex = new Map();
-const kindLabel = { retry: 'Retry', compacted: 'Compacted', branch: 'Branch', replay: 'Repeater' };
+const kindLabel = { retry: 'Retry', compacted: 'Possible compaction', branch: 'Branch', replay: 'Repeater' };
 const nodeRef = (n) => (n ? (n.entry_type === 'repeater' ? 'R' : '#') + n.seq : '');
 function describeNode(n, byId) {
   const p = byId.get(n.parent),
@@ -436,13 +481,13 @@ function describeNode(n, byId) {
     root: n.main ? `Session start · ${n.items} items` : `Separate conversation · ${n.items} items`,
     turn: `After ${ref} · +${n.added} items`,
     retry: `Same request as ${ref}`,
-    compacted: `Compacted after ${ref} · ${kept}`,
+    compacted: `Shortened prefix after ${ref} · ${kept}`,
     branch: `Branched from ${ref} · ${kept}`,
     replay: `Repeater run of ${ref}`,
   }[n.kind];
 }
 function treeSignature(g) {
-  return [g.requests, g.replays, g.last, g.latest.status, g.latest.ended].join('|');
+  return [g.requests, g.replays, g.queued, g.running, g.settled, g.previewed, g.activitySeq, g.last, g.latest.status, g.latest.ended].join('|');
 }
 async function ensureTree(id, agent, session, sig) {
   const cached = trees.get(id);
@@ -481,7 +526,16 @@ function previewLine(r, hit) {
   if (hit) {
     line.append(el('small', hit.side), el('span', hit.preview, 'snippet'));
     line.title = pointer(hit.path);
-  } else line.append(roleBadge(r.last_role), el('span', r.last_preview || '—', 'snippet'));
+  } else {
+    line.append(roleBadge(r.last_role));
+    if (r.last_role === 'tool') line.append(icon('wrench'));
+    line.append(el('span', r.last_preview || '—', 'snippet'));
+    if (r.final_preview != null) {
+      line.append(el('small', 'Final answer', 'phaseBadge'));
+      if (r.final_preview) line.append(el('span', r.final_preview, 'snippet'));
+    }
+    line.title = [r.last_preview, r.final_preview].filter(Boolean).join(' · ');
+  }
   if (r.status !== 'complete')
     line.append(el('small', traceStatus(r), 'eventStatus ' + r.status));
   return line;
@@ -565,7 +619,7 @@ function laneGutter(lane, width, flipped, n) {
     path(`M${x(i)} 0C${x(i)} 35 ${x(lane.lane)} 25 ${x(lane.lane)} 50`, i);
   if (lane.up) path(`M${x(lane.lane)} 0V50`, lane.lane);
   if (lane.down) path(`M${x(lane.lane)} 50V100`, lane.lane);
-  const dot = el('span', '', 'laneDot dot-' + (n.side ? 'side' : n.kind));
+  const dot = el('span', '', 'laneDot dot-' + (n.side && lane.lane !== 0 ? 'side' : n.kind));
   if (lane.lane === 0) dot.classList.add('onMain');
   dot.style.left = x(lane.lane) + 'px';
   box.append(svg, dot);
@@ -574,19 +628,20 @@ function laneGutter(lane, width, flipped, n) {
 function treeRow(g, n, lane, width, flipped, byId) {
   const hit = g.matches.find((m) => m.id === n.id);
   const row = el('button', '', 'eventRow treeRow');
-  if (!n.main) row.classList.add('offMain');
+  if (lane.lane !== 0) row.classList.add('offMain');
   if (hit) row.classList.add('hitRow');
   row.dataset.id = n.id;
   row.setAttribute('aria-current', String(n.id === selected?.id));
   const body = el('span', '', 'treeBody');
   const top = el('span', '', 'eventTop');
   top.append(el('small', nodeRef(n)));
-  const label = n.side
+  const side = n.side && lane.lane !== 0;
+  const label = side
     ? 'Side'
     : n.kind === 'root' && !n.main
       ? 'Separate'
       : kindLabel[n.kind];
-  if (label) top.append(el('span', label, 'kindBadge kind-' + (n.side ? 'side' : n.kind)));
+  if (label) top.append(el('span', label, 'kindBadge kind-' + (side ? 'side' : n.kind)));
   top.append(el('span', '', 'grow'), el('time', time(n.started)));
   body.append(top, previewLine(n, hit?.hit));
   row.title = describeNode(n, byId);
@@ -606,7 +661,7 @@ function paintTree() {
   $('treeTitle').textContent = g.title || 'Session';
   $('treeTitle').title = g.title || '';
   $('treeMeta').textContent = sessionCounts(g);
-  $('mainOnly').checked = mainPathOnly;
+  $('mainOnly').checked = activeOnly;
   const tree = trees.get(g.id),
     sig = treeSignature(g);
   if (tree?.sig !== sig) void ensureTree(g.id, g.agent, g.session, sig).catch(explain);
@@ -615,9 +670,10 @@ function paintTree() {
     scroll = box.scrollTop;
   let nodes = tree.nodes
     .slice()
-    .sort((a, b) => b.started - a.started || (b.entry_type === a.entry_type ? b.seq - a.seq : 0));
-  if (mainPathOnly) nodes = nodes.filter((n) => n.main);
-  const layout = laneLayout(nodes);
+    .sort((a, b) => b.started - a.started || (a.entry_type === b.entry_type ? b.seq - a.seq : a.entry_type === 'repeater' ? -1 : 1));
+  const active = activeBranch(nodes);
+  if (activeOnly) nodes = nodes.filter((n) => active.has(n.id));
+  const layout = laneLayout(nodes, active);
   const flipped = sort === 'time' && asc;
   const order = nodes.map((n, i) => [n, layout.rows[i]]);
   if (flipped) order.reverse();
@@ -628,7 +684,7 @@ function paintTree() {
   if (focus) box.querySelector('[aria-current=true]')?.focus({ preventScroll: true });
 }
 $('mainOnly').onchange = () => {
-  mainPathOnly = $('mainOnly').checked;
+  activeOnly = $('mainOnly').checked;
   paintTree();
 };
 function renderTurn(box) {
@@ -700,10 +756,8 @@ async function select(id, open = false, jump = true) {
     hitRecord = id;
     hitQuery = filters.query();
     activeHits = row.hit
-      ? searchConditions(hitQuery).flatMap((query) => [
-          ...searchHits(selected.body, 'request', query),
-          ...searchHits(selected.response, 'response', query),
-        ])
+      ? searchConditions(hitQuery).flatMap(query =>
+          [...rankedHits(selected.body, selected.response, query, row.hit.kept)])
       : [];
     hitIndex = 0;
   }
@@ -1272,7 +1326,7 @@ function draftStatus() {
   $('warning').textContent = warning;
   $('undo').disabled = !undoStack.length;
   $('redo').disabled = !redoStack.length;
-  $('send').disabled = !!warning || posting || runs.some((r) => r.status === 'running');
+  $('send').disabled = !!warning || posting;
   $('draftModel').textContent = draft.model || 'Select model';
   $('modelMenu').inert = !!field?.error;
 }
@@ -1308,6 +1362,7 @@ function inlineSource(label, read) {
     if (card && !field.error) {
       card.querySelector(':scope > summary .snippet').textContent = messagePreview(
         draftEntries()[Number(card.dataset.index)]?.message,
+        toolLookup(draftEntries().map(e => e.message)),
       );
     }
     box.setAttribute('aria-invalid', String(!!field.error));
@@ -1567,18 +1622,27 @@ function responseContent(reply, protocol = 'chat', includeEnvelope = false) {
   if (messages.some((m) => !m)) return jsonPanel(reply);
 
   const panel = el('div');
+  if (protocol === 'responses' && ['incomplete', 'failed'].includes(reply?.status)) {
+    const state = reply.status === 'incomplete' ? 'Incomplete' : 'Failed';
+    panel.append(el('p', [state, reply.incomplete_details?.reason, reply.error?.message || reply.error?.code]
+      .filter(Boolean).join(' · '), 'responseOutcome ' + reply.status));
+  }
   if (emptyOutput) {
     const tokens = reply.usage?.output_tokens;
     const detail = Number.isSafeInteger(tokens) ? ` Reported output tokens: ${tokens}.` : '';
     panel.append(el('p', 'The recorded response contains no output items.' + detail, 'hint'));
-    if (reply.error?.message || reply.incomplete_details?.reason)
-      panel.append(el('p', reply.error?.message || reply.incomplete_details.reason));
+
   }
   const lookup = toolLookup(messages);
   for (const [i, message] of messages.entries()) {
     const choice = reply.choices?.[i] || {};
+    const block = message.content?.[0];
+    const open = protocol !== 'responses' || (
+      !['reasoning','compaction','compaction_trigger','additional_tools'].includes(block?.type) &&
+      (phaseLabel(message) !== 'Progress' || messages.length === 1)
+    );
     panel.append(
-      messageCard(message, Number.isInteger(choice.index) ? choice.index : i, true, null, lookup),
+      messageCard(message, Number.isInteger(choice.index) ? choice.index : i, open, null, lookup),
     );
     if (choice.finish_reason && choice.finish_reason !== 'stop')
       panel.append(el('small', 'Finish reason · ' + choice.finish_reason));
@@ -1618,6 +1682,21 @@ async function refreshDraftDiff(output) {
     if (output.isConnected) output.replaceChildren(el('p', error.message, 'hint'));
   }
 }
+function failurePanel(failure) {
+  const panel = el('section', '', 'runFailure');
+  panel.append(el('strong', failure.http ? 'Gateway HTTP ' + failure.http : 'No HTTP response'));
+  panel.append(el('p', failure.message));
+  const facts = el('dl');
+  for (const [name, value] of [
+    ['Error code', failure.code], ['Error type', failure.type],
+    ['Request ID', failure.requestId], ['Retry-After', failure.retryAfter],
+  ]) {
+    if (value) facts.append(el('dt', name), el('dd', value));
+  }
+  if (facts.childElementCount) panel.append(facts);
+  if (failure.truncated) panel.append(el('small', 'Error body truncated at 8 KiB.'));
+  return panel;
+}
 function paintRun() {
   tabs('runTabs', ['Answer', 'Response JSON', 'Request snapshot'], rTab, (v) => {
     rTab = v;
@@ -1636,6 +1715,19 @@ function paintRun() {
     .filter(Boolean)
     .join(' · ');
   if (rTab === 'Request snapshot' && s.body) box.append(jsonPanel(s.body));
+  else if (s.status === 'failed' && s.failure) {
+    if (rTab === 'Response JSON' && reply) box.append(jsonPanel(reply));
+    else if (rTab === 'Response JSON' && s.failure.raw) {
+      let raw;
+      try { raw = JSON.parse(s.failure.raw); } catch {}
+      box.append(raw === undefined ? el('pre', s.failure.raw) : jsonPanel(raw));
+      if (s.failure.truncated) box.append(el('small', 'Error body truncated at 8 KiB.'));
+    } else {
+      box.append(failurePanel(s.failure));
+      if (reply?.output?.length) box.append(responseContent(reply, source.protocol));
+    }
+  }
+  else if (s.status === 'queued') box.append(queuedMessage(s.id, () => updateRuns(true)));
   else if (reply)
     box.append(
       rTab === 'Response JSON' ? jsonPanel(reply) : responseContent(reply, source.protocol),
@@ -1645,11 +1737,11 @@ function paintRun() {
       el(
         'p',
         s.error ||
-          (s.status === 'running'
-            ? 'Waiting for the model…'
-            : s.status === 'draft'
-              ? 'This draft has not been sent.'
-              : 'No complete response available.'),
+          ({
+            running: 'Waiting for the model…',
+            draft: 'This draft has not been sent.',
+            canceled: 'Canceled before sending.',
+          }[s.status] || 'No complete response available.'),
         'hint',
       ),
     );
@@ -1682,7 +1774,7 @@ async function updateRuns(force = false) {
     force ||
     snapshot?.id !== (picked === 'original' ? baseId : picked) ||
     (info && info.status !== snapshot?.status) ||
-    (picked === 'original' && ['pending', 'running'].includes(snapshot?.status))
+    (picked === 'original' && ['pending', 'queued', 'running'].includes(snapshot?.status))
   ) {
     const s =
       picked === 'original'
@@ -1714,12 +1806,14 @@ async function send() {
       cleanDraft = body;
       dirty = draft !== body || !!field?.error;
       if (previouslyDirty !== dirty) markDraft();
-      await updateRuns(true);
     }
   } finally {
     posting = false;
     $('studio').inert = false;
-    if (draft) await updateRuns();
+    if (draft) {
+      draftStatus();
+      await updateRuns();
+    }
   }
 }
 $('runSelect').onchange = invoke(async () => {

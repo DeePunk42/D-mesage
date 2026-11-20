@@ -25,13 +25,21 @@ export function groupRows(rows) {
         latest: row,
         requests: 0,
         replays: 0,
+        settled: 0,
+        previewed: 0,
+        queued: 0,
+        running: 0,
         matches: [],
       };
       groups.set(id, group);
       entries.push(group);
     }
-    if (row.entry_type === 'repeater') group.replays++;
-    else group.requests++;
+    if (row.ended != null) group.settled++;
+    if (row.preview_version) group.previewed++;
+    if (row.entry_type === 'repeater') {
+      group.replays++;
+      if (row.status === 'queued' || row.status === 'running') group[row.status]++;
+    } else group.requests++;
     group.first = Math.min(group.first, row.started);
     const latest = group.latest;
     if (row.started > latest.started || (row.started === latest.started && row.seq > latest.seq)) {

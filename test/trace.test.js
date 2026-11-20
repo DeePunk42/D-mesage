@@ -798,3 +798,160 @@ test('session tree API indexes requests by session ID and rejects requests witho
     await server.stop(true);
   }
 });
+
+test('tabs and MCP share eight slots, queue snapshots in order and cancel only waiting runs', async () => {
+  const { recordState, repeatTrace, snapshot } = await import('../trace-api.js');
+  const arrived = [],
+    held = new Map();
+  let peak = 0;
+  const gateway = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    async fetch(req) {
+      const { messages } = await req.json();
+      const id = req.headers.get('x-magpie-session').slice('replay-'.length);
+      arrived.push(id);
+      const fail = await new Promise((resolve) => held.set(id, resolve));
+      held.delete(id);
+      return fail
+        ? Response.json({ error: { code: 'quota', type: 'rate_limit_error', message: 'Try later' } }, {
+            status: 429, headers: { 'request-id': 'req-test', 'retry-after': '15' },
+          })
+        : Response.json({ choices: [{ message: messages.at(-1) }] });
+    },
+  });
+  const upstream = gateway.url.href;
+  const server = startService({ port, uiKey }, { upstream, restoreMcp: false });
+  async function until(predicate) {
+    for (let i = 0; i < 200; i++) {
+      peak = Math.max(peak, held.size);
+      if (predicate()) return;
+      await Bun.sleep(5);
+    }
+    throw Error('Timed out waiting for replay queue');
+  }
+  try {
+    recordState('start', { agents: ['replay-queue'] });
+    const ctx = { origin: 'local', protocol: 'chat', agent: 'replay-queue', state: {} };
+    await onRequest({ model: 'mock', messages: [{ role: 'user', content: 'original' }] }, ctx);
+    const ref = 'trace:' + ctx.state.traceId;
+    const tab = (await api('tabs/open', { ref }))[1].tab;
+    const copy = (await api('tabs/duplicate', { id: tab.id }))[1].tab;
+    const sendTab = async (t) => {
+      const [status, run] = await api('tabs/send', { id: t.id, revision: t.revision });
+      expect(status).toBe(200);
+      return run.id;
+    };
+    const originals = [];
+    for (let i = 0; i < 7; i++) originals.push(await sendTab(tab));
+    originals.push(await sendTab(copy));
+    await until(() => held.size === 8);
+    const key = { ref, request_key: crypto.randomUUID() };
+    const ninth = repeatTrace(key, upstream);
+    expect(ninth.status).toBe('queued');
+    expect(repeatTrace(key, upstream)).toEqual(ninth);
+    const mcpId = ninth.run_ref.slice(4);
+    const tenth = await sendTab(tab);
+    const canceled = await sendTab(copy);
+    expect((await api('cancel/' + canceled, {}))[1].status).toBe('canceled');
+    expect((await api('cancel/' + originals[0], {}))[0]).toBe(400);
+    const revision = crypto.randomUUID();
+    const text = JSON.stringify(tab.state);
+    const edited = {
+      ...tab.state,
+      draft: { ...tab.state.draft, messages: [{ role: 'user', content: 'edited' }] },
+    };
+    expect(
+      (
+        await api('tabs/save', {
+          id: tab.id,
+          revision,
+          patches: [
+            { base: tab.revision, at: 0, remove: text.length, text: JSON.stringify(edited) },
+          ],
+        })
+      )[0],
+    ).toBe(200);
+    const last = await sendTab({ ...tab, revision });
+    await api('tabs/pick', { id: tab.id, run: tenth });
+    expect(arrived).toHaveLength(8);
+    for (const [slot, next, fail] of [
+      [6, mcpId, true],
+      [2, tenth, false],
+      [7, last, false],
+    ]) {
+      held.get(originals[slot])(fail);
+      await until(() => held.has(next));
+      expect(arrived.at(-1)).toBe(next);
+    }
+    for (const release of held.values()) release(false);
+    await until(() => !storage().query('SELECT 1 FROM replay_jobs LIMIT 1').get());
+    expect(peak).toBe(8);
+    expect(arrived).not.toContain(canceled);
+    const failed = (await api('snapshot/' + originals[6]))[1];
+    expect(failed.status).toBe('failed');
+    expect(failed.failure).toMatchObject({
+      http: 429, code: 'quota', type: 'rate_limit_error', message: 'Try later',
+      requestId: 'req-test', retryAfter: '15',
+    });
+    expect(JSON.parse(failed.failure.raw).error.code).toBe('quota');
+    expect((await api('snapshot/' + last))[1].failure).toBeNull();
+    for (const [id, content] of [
+      [mcpId, 'original'],
+      [tenth, 'original'],
+      [last, 'edited'],
+    ]) {
+      const s = snapshot('run:' + id);
+      expect(JSON.parse(s.request).messages.at(-1).content).toBe(content);
+      expect(JSON.parse(s.reply).choices[0].message.content).toBe(content);
+    }
+    const restored = (await api('tabs/select', { id: tab.id }))[1].tab;
+    expect(restored.selected_run).toBe(tenth);
+    expect(restored.state.draft).toEqual(edited.draft);
+    expect((await api('tabs/runs?id=' + copy.id))[1].runs.map((r) => r.id)).toEqual([
+      originals[7],
+      canceled,
+    ]);
+  } finally {
+    for (const release of held.values()) release(false);
+    await server.stop(true);
+    await gateway.stop(true);
+  }
+});
+
+test('replay failures keep protocol error codes and bound non-JSON gateway errors', async () => {
+  const error = { type: 'overloaded_error', code: 'busy', message: 'Overloaded' };
+  for (const protocol of ['chat', 'anthropic', 'responses']) {
+    const event = protocol === 'responses' ? { type: 'error', code: error.code, message: error.message } : { type: 'error', error };
+    const stream = new Response('data: ' + JSON.stringify(event) + '\n\n', {
+      headers: { 'content-type': 'text/event-stream' },
+    });
+    for (const response of [Response.json({ error }), stream]) {
+      const failure = await readReply(response, protocol).catch((e) => e);
+      expect(failure.message).toBe('Overloaded');
+      expect((failure.envelope.error ?? failure.envelope).code).toBe('busy');
+    }
+  }
+  const failed = { status: 'failed', output: [], error };
+  expect(await readReply(Response.json(failed), 'responses')).toEqual(failed);
+  const large = await readReply(new Response('x'.repeat(9000), { status: 502 })).catch((e) => e);
+  expect(large.raw.length).toBe(8192);
+  expect(large.truncated).toBe(true);
+});
+
+test('old captures and replay snapshots gain independent summaries without rewriting wire bodies', async () => {
+  const {backfillPreviews} = await import('../store.js');
+  const db = storage();
+  const id=crypto.randomUUID(), exp=crypto.randomUUID(), run=crypto.randomUUID();
+  const body=(name)=>JSON.stringify({input:[{type:'function_call',call_id:'1',name},
+    {type:'function_call_output',call_id:'1',output:'done'}]});
+  const reply=JSON.stringify({output:[{role:'assistant',phase:'final_answer',content:[{text:'Ready'}]}]});
+  db.query("INSERT INTO calls(id,session,model,started,status,request,reply,owner,protocol,last_preview) VALUES(?,'','m',0,'complete',?,?,0,'responses','stale')").run(id,body('one'),reply);
+  db.query('INSERT INTO experiments VALUES(?,?,0,?)').run(exp,id,body('two'));
+  db.query("INSERT INTO runs(id,experiment_id,kind,started,status,owner,reply) VALUES(?,?,'send',0,'complete',0,?)").run(run,exp,reply);
+  while(backfillPreviews(2,db)) {}
+  expect(db.query('SELECT request,reply,last_preview,final_preview FROM calls WHERE id=?').get(id))
+    .toEqual({request:body('one'),reply,last_preview:'one · done',final_preview:'Ready'});
+  expect(db.query('SELECT last_preview,final_preview FROM runs WHERE id=?').get(run))
+    .toEqual({last_preview:'two · done',final_preview:'Ready'});
+});

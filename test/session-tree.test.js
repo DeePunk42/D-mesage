@@ -66,20 +66,24 @@ test('an unrelated request in the same session starts a new root', () => {
   expect([...chat([{ role: 'user', content: 'hi' }, { role: 'assistant', content: 'yo' }])].slice(0, 2)).toEqual([...first]);
 });
 
-test('lane layout keeps the main path in lane 0 and joins branches at their parent', async () => {
-  const { laneLayout } = await import('../ui/session-graph.js');
+test('the latest capture and its ancestors occupy lane 0 even when an older fork is larger', async () => {
+  const { activeBranch, laneLayout } = await import('../ui/session-graph.js');
   const nodes = [
-    { id: 'm3', parent: 'm2', main: true },
-    { id: 's', parent: 'm1', main: false },
-    { id: 'm2', parent: 'm1', main: true },
-    { id: 'm1', parent: null, main: true },
-  ];
-  expect(laneLayout(nodes)).toEqual({
+    { id: 'new', parent: 'root' },
+    { id: 'old2', parent: 'old1' },
+    { id: 'old1', parent: 'root' },
+    { id: 'root', parent: null },
+  ].map(node => ({ ...node, entry_type: 'capture' }));
+  const active = activeBranch([{ id: 'replay', entry_type: 'repeater', parent: 'old2' }, ...nodes]);
+  expect([...active]).toEqual(['new', 'root']);
+  expect([...activeBranch([{ id: 'separate', entry_type: 'capture', parent: null }, ...nodes])]).toEqual(['separate']);
+  expect([...activeBranch([{ id: 'back', entry_type: 'capture', parent: 'old2' }, ...nodes])]).toEqual(['back', 'old2', 'old1', 'root']);
+  expect(laneLayout(nodes, active)).toEqual({
     width: 2,
     rows: [
       { lane: 0, through: [], merges: [], up: false, down: true },
       { lane: 1, through: [0], merges: [], up: false, down: true },
-      { lane: 0, through: [1], merges: [], up: true, down: true },
+      { lane: 1, through: [0], merges: [], up: true, down: true },
       { lane: 0, through: [], merges: [1], up: true, down: false },
     ],
   });

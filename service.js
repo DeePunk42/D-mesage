@@ -4,17 +4,19 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   storage,
+  backfillPreviews,
   recording,
   captureScope,
   clearedThrough,
   clearHistory,
   dataDir,
   reconcile,
+  reconcileReplays,
 } from './store.js';
 import { gatewayAgents } from './agent-catalog.js';
 import { recordState, snapshot } from './trace-api.js';
 import { tabRequest } from './repeater-tabs.js';
-import { launch } from './replay.js';
+import { launch, drainReplays, cancelQueuedRun } from './replay.js';
 import { traceSearch } from './trace-search.js';
 import { requestPatch } from './request-diff.js';
 import { backfillChains, sessionTree } from './session-tree.js';
@@ -27,6 +29,7 @@ const assets = new Map([
   ['/app.js', 'app.js'],
   ['/tab-save.js', 'tab-save.js'],
   ['/messages.js', 'messages.js'],
+  ['/response-items.js', 'response-items.js'],
   ['/protocols.js', 'protocols.js'],
   ['/prompt-syntax.js', 'prompt-syntax.js'],
   ['/views.js', 'views.js'],
@@ -47,12 +50,12 @@ for (const key of ['deepseek-color', 'openai', 'gemini-color', 'qwen-color', 'ki
 // Both branches return metadata only. A replay keeps its own ID, status and request preview.
 const timeline = `WITH events AS (
   SELECT 'capture' AS entry_type, c.rowid AS seq, c.id, c.id AS call_id, c.rowid AS call_seq,
-    c.session,c.agent,c.model,c.protocol,c.endpoint,c.started,c.ended,c.status,c.last_role,c.last_preview,octet_length(c.request) AS bytes
+    c.session,c.agent,c.model,c.protocol,c.endpoint,c.started,c.ended,c.status,c.last_role,c.last_preview,c.final_preview,c.preview_version,octet_length(c.request) AS bytes
   FROM calls c
   UNION ALL
   SELECT 'repeater',r.rowid,r.id,c.id,c.rowid,c.session,c.agent,coalesce(r.model,c.model),c.protocol,c.endpoint,r.started,r.ended,r.status,
     CASE WHEN r.kind='baseline' THEN c.last_role ELSE r.last_role END,
-    CASE WHEN r.kind='baseline' THEN c.last_preview ELSE r.last_preview END,
+    CASE WHEN r.kind='baseline' THEN c.last_preview ELSE r.last_preview END,r.final_preview,r.preview_version,
     CASE WHEN r.kind='baseline' THEN octet_length(c.request) ELSE octet_length(e.body) END
   FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id
 )`;
@@ -84,7 +87,7 @@ export function startService(options, overrides = {}) {
   const titles = new Map();
   function sessionTitle(row, db) {
     const key = row.agent + '\u0000' + row.session,
-      sig = row.requests + ':' + row.latest.seq;
+      sig = [row.requests, row.latest.seq, row.previewed].join(':');
     const cached = titles.get(key);
     if (cached?.sig === sig) return cached.title;
     let title = '';
@@ -100,13 +103,6 @@ export function startService(options, overrides = {}) {
     if (titles.size > 200) titles.delete(titles.keys().next().value);
     return title;
   }
-  const backfill = setInterval(() => {
-    try {
-      backfillChains();
-    } catch (error) {
-      console.error('D-message: session index failed', error.message);
-    }
-  }, 1500);
   const server = Bun.serve({
     port,
     hostname: '127.0.0.1',
@@ -145,7 +141,7 @@ export function startService(options, overrides = {}) {
           url.origin +
           "; connect-src 'self' " +
           url.origin +
-          "; img-src 'self' " +
+          "; img-src 'self' data: " +
           url.origin +
           "; base-uri 'none'; form-action 'none'";
         return new Response(file, { headers });
@@ -260,8 +256,14 @@ export function startService(options, overrides = {}) {
                   total: entries.length,
                 };
               })();
-          for (const row of page.calls)
-            if (row.entry_type === 'session') row.title = sessionTitle(row, db);
+          for (const row of page.calls) {
+            if (row.entry_type !== 'session') continue;
+            row.title = sessionTitle(row, db);
+            // A new capture can move the active branch without matching the list filter.
+            if (q || type || status)
+              row.activitySeq = db.query('SELECT rowid AS seq FROM calls WHERE agent=? AND session=? ORDER BY started DESC,rowid DESC LIMIT 1')
+                .get(row.agent, row.session)?.seq;
+          }
           return send({
             recording: recording(db),
             scope: captureScope(db),
@@ -280,7 +282,7 @@ export function startService(options, overrides = {}) {
           if (typeof enabled !== 'boolean') throw Error('Invalid recording state.');
           return send(await captureState(enabled ? 'start' : 'stop'));
         }
-        const match = url.pathname.match(/^\/api\/(calls|runs|send|snapshot)\/([\da-f-]{36})$/);
+        const match = url.pathname.match(/^\/api\/(calls|runs|send|snapshot|cancel)\/([\da-f-]{36})$/);
         if (!match) return send({ error: 'Not found' }, 404);
         const [, action, id] = match;
         if (action === 'calls' && req.method === 'GET') {
@@ -306,12 +308,13 @@ export function startService(options, overrides = {}) {
             .all(id);
           return send({ runs, drafts });
         }
+        if (action === 'cancel' && req.method === 'POST') return send(cancelQueuedRun(db, id));
         if (action === 'snapshot' && req.method === 'GET') {
           const row =
             db
               .query(
                 `SELECT r.id,r.rowid AS seq,'repeater' AS entry_type,c.id AS call_id,c.rowid AS call_seq,
-                  c.session,c.agent,coalesce(r.model,c.model) AS model,c.protocol,c.endpoint,r.kind,r.started,r.ended,r.status,r.reply,r.error,CASE WHEN r.kind='baseline' THEN c.request ELSE e.body END AS request FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id WHERE r.id=?`,
+                  c.session,c.agent,coalesce(r.model,c.model) AS model,c.protocol,c.endpoint,r.kind,r.started,r.ended,r.status,r.reply,r.error,r.failure,CASE WHEN r.kind='baseline' THEN c.request ELSE e.body END AS request FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id WHERE r.id=?`,
               )
               .get(id) ||
             db
@@ -319,6 +322,7 @@ export function startService(options, overrides = {}) {
                 "SELECT id,'draft' AS status,body AS request,NULL AS reply FROM experiments WHERE id=?",
               )
               .get(id);
+          if (row?.failure) row.failure = JSON.parse(row.failure);
           return row ? send(row) : send({ error: 'Record not found' }, 404);
         }
         if (action === 'send' && req.method === 'POST') {
@@ -333,7 +337,24 @@ export function startService(options, overrides = {}) {
       }
     },
   });
-  if (overrides.restoreMcp !== false) mcp.restore();
+  function resumeReplays() {
+    const db = storage();
+    reconcileReplays(db);
+    drainReplays(db);
+  }
+  const backfill = setInterval(() => {
+    try {
+      if (overrides.restoreMcp !== false) resumeReplays();
+      backfillPreviews();
+      backfillChains();
+    } catch (error) {
+      console.error('D-message: background processing failed', error.message);
+    }
+  }, 1500);
+  if (overrides.restoreMcp !== false) {
+    resumeReplays();
+    mcp.restore();
+  }
   return {
     url: server.url,
     stop(force) {

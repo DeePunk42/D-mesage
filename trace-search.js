@@ -1,6 +1,7 @@
 import { Worker, parentPort, workerData } from 'node:worker_threads';
 import { Database } from 'bun:sqlite';
-import { searchConditions, searchHits } from './ui/search.js';
+import { searchConditions, rankedHits } from './ui/search.js';
+import { searchTurnBounds } from './session-tree.js';
 import { groupRows } from './list-groups.js';
 
 export function traceSearch(path) {
@@ -54,6 +55,7 @@ if (parentPort && workerData?.path) {
       const matches = cache.get(cacheKey);
       const result = db.transaction(() => {
         const matched = [];
+        const sessions = new Map();
         const version = db.query("SELECT value FROM settings WHERE key='cleared_cursor'").get();
         const clearedThrough = Number(version?.value || 0);
         const rows = db.query(options.sql).iterate(...options.args);
@@ -61,22 +63,20 @@ if (parentPort && workerData?.path) {
           const stamp = row.status + '|' + row.ended;
           let match = matches.get(row.id);
           if (match?.stamp !== stamp) {
-            const parsed = {};
-            let raw,
-              hit = null;
+            const raw = (row.entry_type === 'capture' ? capture : replay).get(row.id);
+            const request = JSON.parse(raw.request);
+            const response = JSON.parse(raw.reply);
+            let kept, hit = null;
+            if (row.protocol === 'responses' && row.session && row.entry_type === 'capture') {
+              const key = JSON.stringify([row.agent, row.session]);
+              if (!sessions.has(key)) sessions.set(key, searchTurnBounds(db, row.agent, row.session));
+              kept = sessions.get(key).get(row.id);
+            }
             const found = conditions.every((query) => {
-              for (const side of ['request', 'response']) {
-                if (!['all', 'tool', side].includes(query.scope)) continue;
-                raw ??= (row.entry_type === 'capture' ? capture : replay).get(row.id);
-                if (!(side in parsed))
-                  parsed[side] = JSON.parse(
-                    (side === 'request' ? raw.request : raw.reply) ?? 'null',
-                  );
-                const field = searchHits(parsed[side], side, query).next().value;
-                if (field) {
-                  hit ??= field;
-                  return true;
-                }
+              const field = rankedHits(request, response, query, kept).next().value;
+              if (field) {
+                hit ??= { ...field, kept };
+                return true;
               }
               return (
                 query.scope === 'all' &&

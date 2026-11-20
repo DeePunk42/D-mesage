@@ -36,6 +36,21 @@ export function backfillChains(limit = 20, db = storage()) {
   return rows.length ? db.transaction(() => storeChains(db, rows))() : 0;
 }
 
+// Search runs with a read-only database. Use the tree's prefix rule, including for
+// new captures whose background chain backfill has not reached them yet.
+export function searchTurnBounds(db, agent, session) {
+  const rows = db.query(`SELECT c.id,k.chain FROM calls c LEFT JOIN call_chain k
+    ON k.call_id=c.id AND k.version=? WHERE c.agent=? AND c.session=? ORDER BY c.started,c.rowid`)
+    .all(CHAIN_VERSION, agent, session);
+  const missing = db.query('SELECT protocol,request FROM calls WHERE id=?');
+  const nodes = buildShape(rows.map(row => {
+    if (row.chain) return readChain(row.chain);
+    const {protocol, request} = missing.get(row.id);
+    return requestChain(protocol, JSON.parse(request)) ?? new BigUint64Array(0);
+  }));
+  return new Map(rows.map((row, i) => [row.id, nodes[i].parent == null ? undefined : nodes[i].kept]));
+}
+
 const cache = new Map();
 
 export function sessionTree(agent, session, db = storage()) {
@@ -46,7 +61,7 @@ export function sessionTree(agent, session, db = storage()) {
   if (pending.length) db.transaction(() => storeChains(db, pending))();
   const calls = db
     .query(
-      `SELECT c.id,c.rowid AS seq,c.started,c.ended,c.status,c.model,c.last_role,c.last_preview
+      `SELECT c.id,c.rowid AS seq,c.started,c.ended,c.status,c.model,c.last_role,c.last_preview,c.final_preview
        FROM calls c JOIN call_chain k ON k.call_id=c.id WHERE c.agent=? AND c.session=? ORDER BY c.started,c.rowid`,
     )
     .all(agent, session);
@@ -76,7 +91,7 @@ export function sessionTree(agent, session, db = storage()) {
     const runs = db
       .query(
         `SELECT r.id,r.rowid AS seq,e.call_id AS parent,r.started,r.ended,r.status,coalesce(r.model,c.model) AS model,
-          r.last_role,r.last_preview FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id
+          r.last_role,r.last_preview,r.final_preview FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id
          WHERE c.agent=? AND c.session=? ORDER BY r.started,r.rowid`,
       )
       .all(agent, session);

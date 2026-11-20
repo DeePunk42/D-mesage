@@ -73,7 +73,7 @@ function toolsFor(upstream, captureState) {
   );
   tool(
     'trace_repeat',
-    'Send one isolated inference to the configured gateway. No client function is executed. Retry using the same request_key and ref to retrieve the same run.',
+    'Queue one inference through the configured gateway. Up to eight runs execute concurrently. No client function is executed. Retry using the same request_key and ref to retrieve the same run.',
     { ref, request_key: z.string().trim().min(1).max(200) },
     (args) => repeatTrace(args, upstream),
   );

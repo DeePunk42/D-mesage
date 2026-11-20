@@ -1,3 +1,6 @@
+import { requestEntries } from './protocols.js';
+import { itemLabel, toolLookup } from './response-items.js';
+
 // The wire role remains authoritative even when a text block contains role-like markup.
 export function compactText(value, limit = 130) {
   const text = String(value ?? '')
@@ -6,9 +9,11 @@ export function compactText(value, limit = 130) {
   const prefix = [...text.slice(0, limit * 2 + 2)].slice(0, limit).join('');
   return prefix.length < text.length ? prefix + '…' : prefix;
 }
-export function partPreview(part) {
+export function partPreview(part, lookup) {
   if (typeof part === 'string') return part;
   if (!part || typeof part !== 'object') return JSON.stringify(part);
+  const label = itemLabel(part, lookup);
+  if (label) return label;
   if (typeof part.text === 'string') return part.text;
   if (typeof part.thinking === 'string') return part.thinking;
   if (
@@ -35,12 +40,13 @@ export function partPreview(part) {
     { image_url: 'Image', input_audio: 'Audio', file: 'File' }[part.type] || part.type || 'JSON'
   );
 }
-export function messagePreview(msg) {
+export function messagePreview(msg, lookup) {
   if (!msg) return '';
+  if (msg.type === 'additional_tools') return compactText(itemLabel(msg));
   const c = msg.content;
   if (typeof c === 'string' && c.trim()) return compactText(c);
   if (Array.isArray(c) && c.length)
-    return (c.length > 1 ? c.length + ' blocks · ' : '') + compactText(partPreview(c[0]));
+    return (c.length > 1 ? c.length + ' blocks · ' : '') + compactText(partPreview(c[0], lookup));
   const names = Array.isArray(msg.tool_calls)
     ? msg.tool_calls.map((t) => t?.function?.name).filter(Boolean)
     : [];
@@ -49,6 +55,13 @@ export function messagePreview(msg) {
   if (msg.refusal || msg.reasoning_content)
     return compactText(msg.refusal || msg.reasoning_content);
   return c == null ? 'No content' : compactText(JSON.stringify(c));
+}
+export function requestPreview(protocol, body) {
+  const entries = requestEntries(protocol, body);
+  const last = entries.at(-1)?.message;
+  const lookup = protocol === 'responses' && last?.role === 'tool'
+    ? toolLookup(entries.map(e => e.message)) : undefined;
+  return { role: last?.role || '', text: messagePreview(last, lookup) };
 }
 export function pairingWarning(messages) {
   const waiting = new Map();

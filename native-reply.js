@@ -30,9 +30,16 @@ export async function* sseData(body) {
     await reader.cancel().catch(() => {});
   }
 }
+// Keep the protocol error envelope until the replay worker records the failure.
+export function replyError(payload, fallback) {
+  const error = payload?.error ?? payload;
+  const message = typeof error === 'string' ? error : error?.message;
+  return Object.assign(new Error(typeof message === 'string' && message || fallback), { envelope: payload });
+}
+
 export function nativeReply(protocol, r) {
   if (r?.error && !Array.isArray(r.output))
-    throw Error(r.error.message || 'Gateway response error.');
+    throw replyError(r, 'Gateway response error.');
   if (
     protocol === 'responses' &&
     Array.isArray(r?.output) &&
@@ -49,7 +56,7 @@ export async function nativeStream(protocol, body) {
   for await (const data of sseData(body)) {
     if (data === '[DONE]') break;
     const e = JSON.parse(data);
-    if (e.type === 'error') throw Error(e.error?.message || e.message || 'Stream error');
+    if (e.type === 'error') throw replyError(e, 'Stream error');
     if (protocol === 'responses') {
       if (e.type === 'response.output_item.done') items[e.output_index] = e.item;
       if (['response.completed', 'response.incomplete', 'response.failed'].includes(e.type)) {

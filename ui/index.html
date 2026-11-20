@@ -3,13 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>D-message</title>
     <link rel="stylesheet" href="style.css" />
     <script type="module" src="app.js"></script>
   </head>
   <body>
     <header>
-      <h1>D-message</h1>
+      <h1><svg aria-hidden="true" viewBox="0 0 32 32"><path d="M8 8h9a7 7 0 0 1 0 14h-4l-5 4V8Z"/><path d="M13 13h7m-7 4h4"/></svg>D-message</h1>
       <nav aria-label="Workspaces">
         <button id="toTrace" aria-pressed="true">Trace</button
         ><button id="toRepeat" aria-pressed="false">Repeater</button
@@ -65,7 +66,10 @@
                   <option value="complete">Complete</option>
                   <option value="incomplete">Incomplete</option>
                   <option value="pending">Pending</option>
-                  <option value="running">Sending</option>
+                  <option value="queued">Queued</option>
+                  <option value="running">Running</option>
+                  <option value="canceled">Canceled</option>
+                  <option value="interrupted">Interrupted</option>
                   <option value="failed">Failed</option>
                 </select></label
               >
@@ -114,7 +118,7 @@
             <h2 id="treeTitle"></h2>
             <small id="treeMeta"></small>
           </div>
-          <label class="mainOnly"><input type="checkbox" id="mainOnly" />Main path only</label>
+          <label class="mainOnly"><input type="checkbox" id="mainOnly" />Active branch only</label>
         </div>
         <div id="treeRows" class="traceEvents" aria-label="Session requests"></div>
       </section>
@@ -138,7 +142,7 @@
             <button id="backList">‹ Request list</button>
             <h2 id="callTitle"></h2>
             <span class="modelName" id="inspectModel"></span
-            ><button id="fork" class="primary right">Send to Repeater ↗</button>
+            ><button id="fork" class="primary right">Send to Repeater</button>
           </div>
           <div class="panehead">
             <div class="tabs" id="histTabs"></div>
@@ -251,16 +255,21 @@
           <h2>MCP server</h2>
           <small id="mcpStatus" role="status"></small>
         </div>
-        <form id="mcpForm">
-          <label><input id="mcpEnabled" type="checkbox" /> Enable listener</label>
-          <label>Port <input id="mcpPort" type="number" min="1024" max="65535" required /></label>
-          <button class="primary" id="mcpApply">Save settings</button>
+        <form id="mcpForm" class="settingsGroup">
+          <label class="settingsRow">Enable listener <input id="mcpEnabled" type="checkbox" role="switch" /></label>
+          <div class="settingsRow">
+            <label for="mcpPort">Port</label>
+            <input id="mcpPort" type="number" min="1024" max="65535" required />
+            <button class="primary" id="mcpApply">Save settings</button>
+          </div>
         </form>
-        <label>Endpoint <input id="mcpUrl" readonly /></label>
-        <div class="line">
-          <button id="mcpCopy">Copy client config</button><button id="mcpReveal">Show token</button>
+        <div class="settingsGroup">
+          <label class="settingsRow">Endpoint <input id="mcpUrl" readonly /></label>
+          <div class="settingsRow tokenActions">
+            <button id="mcpCopy">Copy client config</button><button id="mcpReveal">Show token</button>
+          </div>
+          <input id="mcpToken" aria-label="MCP access token" readonly hidden />
         </div>
-        <input id="mcpToken" aria-label="MCP access token" readonly hidden />
         <p id="mcpHint" role="status"></p>
       </section>
     </main>

@@ -1,3 +1,4 @@
+import { toolLabel, itemLabel, phaseLabel, resultParts } from './response-items.js';
 import { isTextBlock } from './protocols.js';
 import { compactText, messagePreview, presentation } from './messages.js';
 import { promptSections, promptTokens } from './prompt-syntax.js';
@@ -142,7 +143,8 @@ export function icon(name) {
     undo: 'M4 9h9a6 6 0 0 1 0 12 M4 9l5-5 M4 9l5 5',
     redo: 'M20 9h-9a6 6 0 0 0 0 12 M20 9l-5-5 M20 9l-5 5',
     sliders: 'M3 7h8m4 0h6 M3 17h3m4 0h11 M11 4v6 M7 14v6',
-    agents: 'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m20 0v-2a4 4 0 0 0-3-4M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0Zm4-4a4 4 0 0 1 0 8',
+    agents:
+      'M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2m20 0v-2a4 4 0 0 0-3-4M13 7a4 4 0 1 1-8 0 4 4 0 0 1 8 0Zm4-4a4 4 0 0 1 0 8',
     trash: 'M4 6h16 M9 6V3h6v3 M6 6l1 15h10l1-15 M10 10v7 M14 10v7',
     wrench: 'M14 6a5 5 0 0 0-6 6L3 17a2.2 2.2 0 0 0 3 3l6-6a5 5 0 0 0 6-6l-3 3-3-3 3-3Z',
     pretty: 'm4 20 10-10 3 3L7 23z M16 3v4m-2-2h4 M6 4v6M3 7h6 M20 14v4m-2-2h4',
@@ -180,27 +182,13 @@ export function textBlock(label, value, controls = []) {
   display(false);
   return block;
 }
-export function toolLookup(messages) {
-  const names = new Map();
-  for (const m of messages) {
-    if (Array.isArray(m?.content))
-      for (const part of m.content) {
-        const id = part?.call_id || part?.id;
-        if (id && part.name) names.set(id, part.name);
-      }
-    for (const c of Array.isArray(m?.tool_calls) ? m.tool_calls : []) {
-      if (c?.id && c.function?.name) names.set(c.id, c.function.name);
-    }
-  }
-  return names;
-}
 function toolNames(msg, lookup) {
   const names = (Array.isArray(msg.tool_calls) ? msg.tool_calls : []).map(
     (c) => c?.function?.name || c?.name,
   );
   if (msg.function_call) names.push(msg.function_call.name);
   if (['tool', 'function'].includes(msg.role))
-    names.push(msg.name || lookup?.get(msg.tool_call_id));
+    names.push(msg.name || toolLabel(lookup?.get(msg.tool_call_id)));
   if (Array.isArray(msg.content))
     for (const b of msg.content) {
       if (
@@ -208,32 +196,96 @@ function toolNames(msg, lookup) {
           b?.type,
         )
       )
-        names.push(b.name || b.function?.name);
+        names.push(toolLabel(b));
+      else if (b?.type === 'web_search_call') names.push('web_search');
+      else if (b?.type === 'tool_search_call' || b?.type === 'tool_search_output')
+        names.push('tool_search');
       else if (
         b?.type === 'tool_result' ||
         (typeof b?.type === 'string' && b.type.endsWith('_call_output'))
       )
-        names.push(lookup?.get(b.tool_use_id || b.call_id));
+        names.push(toolLabel(lookup?.get(b.tool_use_id || b.call_id)));
     }
   return [...new Set(names.filter((n) => typeof n === 'string' && n))];
 }
+function disclosure(label, render) {
+  const details = el('details', '', 'itemDetails');
+  details.append(el('summary', label));
+  details.ontoggle = () => {
+    if (details.open && details.childElementCount === 1) details.append(render());
+  };
+  return details;
+}
+function imageResult(block) {
+  const source = block.image_url?.url ?? block.image_url;
+  // Loading a recorded remote URL would contact the original site during inspection.
+  if (typeof source !== 'string' || !/^data:image\/(?:png|jpeg|gif|webp);base64,/i.test(source))
+    return el('span', 'Image reference');
+  return disclosure('Preview image', () => {
+    const img = el('img');
+    img.alt = 'Captured tool result';
+    img.className = 'capturedImage';
+    img.src = source;
+    return img;
+  });
+}
 export function blockData(p, lookup) {
   if (!p || typeof p !== 'object') return jsonTree(p);
+  const label = itemLabel(p, lookup);
+  const raw = () => disclosure('Raw item', () => jsonTree(p));
+  if (p.type === 'reasoning') {
+    const group = el('div');
+    for (const part of Array.isArray(p.summary) ? p.summary : [])
+      group.append(isTextBlock(part) ? showText(part.text ?? part) : jsonTree(part));
+    if (!group.childElementCount) group.append(el('small', label));
+    group.append(raw());
+    return group;
+  }
   if (
     [
-      'function_call',
-      'custom_tool_call',
-      'tool_use',
-      'server_tool_use',
-      'tool_result',
-      'function_call_output',
-      'custom_tool_call_output',
+      'compaction_trigger',
+      'compaction',
+      'configuration_update',
+      'web_search_call',
+      'tool_search_call',
+      'tool_search_output',
+      'additional_tools',
     ].includes(p.type)
+  ) {
+    const group = el('div');
+    group.append(el('b', label), raw());
+    return group;
+  }
+  if (p.type === 'function_call_output' || p.type === 'custom_tool_call_output') {
+    const call = lookup?.get(p.call_id);
+    const group = el('div', '', 'toolEntry');
+    const title = el('div', '', 'toolTitle');
+    title.append(
+      icon('wrench'),
+      el('b', call ? compactText(itemLabel(call) || toolLabel(call)) : 'Tool result'),
+    );
+    group.append(title);
+    for (const part of resultParts(p, call)) {
+      if (part.status) group.append(el('small', part.status, 'resultStatus'));
+      if (part.image) group.append(imageResult(part.image));
+      else if (part.text) group.append(showText(part.text));
+      else if (part.value != null) group.append(jsonTree(part.value));
+    }
+    group.append(raw());
+    return group;
+  }
+  if (
+    ['function_call', 'custom_tool_call', 'tool_use', 'server_tool_use', 'tool_result'].includes(
+      p.type,
+    )
   ) {
     const group = el('div', '', 'toolEntry'),
       title = el('div', '', 'toolTitle');
     const id = p.tool_use_id || p.call_id || p.id;
-    title.append(icon('wrench'), el('b', p.name || lookup?.get(id) || p.type));
+    title.append(
+      icon('wrench'),
+      el('b', label ? compactText(label) : toolLabel(p) || toolLabel(lookup?.get(id)) || p.type),
+    );
     if (id) title.append(el('small', id));
     group.append(title);
     const value = p.arguments ?? p.input ?? p.output ?? p.content;
@@ -244,12 +296,6 @@ export function blockData(p, lookup) {
     return group;
   }
   if (p.type === 'thinking' && typeof p.thinking === 'string') return showText(p.thinking);
-  if (p.type === 'reasoning' && Array.isArray(p.summary) && p.summary.length) {
-    const group = el('div');
-    for (const part of p.summary)
-      group.append(isTextBlock(part) ? showText(part.text ?? part) : jsonTree(part));
-    return group;
-  }
   return jsonTree(p);
 }
 export function sectionTitle(label, items = []) {
@@ -259,15 +305,22 @@ export function sectionTitle(label, items = []) {
 }
 export function messageCard(msg, index, open, actions, lookup) {
   const card = el('details', '', 'messageCard');
+  const type = msg.type === 'additional_tools' ? msg.type : msg.content?.[0]?.type;
+  if (
+    !actions &&
+    ['compaction', 'compaction_trigger', 'reasoning', 'additional_tools'].includes(type)
+  )
+    open = false;
   card.open = open;
   const head = el('summary');
   const badge = roleBadge(msg.role);
   let editBar;
   const names = toolNames(msg, lookup);
-  const snippet = names.length && msg.content == null ? '' : messagePreview(msg);
+  const snippet = names.length && msg.content == null ? '' : messagePreview(msg, lookup);
   head.append(
     el('span', String(index + 1).padStart(2, '0'), 'index'),
     badge,
+    ...(phaseLabel(msg) ? [el('small', phaseLabel(msg), 'phaseBadge')] : []),
     el('span', snippet || (names.length ? '' : 'No content'), 'snippet'),
   );
   if (names.length) {
@@ -288,6 +341,11 @@ export function messageCard(msg, index, open, actions, lookup) {
     const body = el('div', '', 'messageBody');
 
     if (actions?.messageSource(body, index)) {
+      card.append(body);
+      return;
+    }
+    if (msg.type === 'additional_tools') {
+      body.append(blockData(msg, lookup));
       card.append(body);
       return;
     }
@@ -319,8 +377,18 @@ export function messageCard(msg, index, open, actions, lookup) {
         }
       } else body.append(sectionTitle(label), blockData(p, lookup));
     }
+    const attributes = {};
     for (const [name, v] of Object.entries(msg)) {
-      if (name === 'role' || name === 'content') continue;
+      if (
+        msg.type === 'message' &&
+        ['type', 'status', 'id', 'metadata', 'internal_chat_message_metadata_passthrough'].includes(
+          name,
+        )
+      ) {
+        attributes[name] = v;
+        continue;
+      }
+      if (name === 'role' || name === 'content' || (name === 'phase' && phaseLabel(msg))) continue;
       if ((name === 'tool_calls' && Array.isArray(v)) || (name === 'function_call' && v)) {
         const calls = name === 'tool_calls' ? v : [{ function: v }];
         if (calls.length) {
@@ -341,6 +409,8 @@ export function messageCard(msg, index, open, actions, lookup) {
         }
       } else body.append(sectionTitle(name), showText(v));
     }
+    if (Object.keys(attributes).length)
+      body.append(disclosure('Message attributes', () => jsonTree(attributes)));
     card.append(body);
   }
   function updateHeader() {

@@ -3,10 +3,23 @@ export function sessionRowId(agent, session) {
   return 'session:' + encodeURIComponent(agent ?? '') + ':' + encodeURIComponent(session);
 }
 
-// Git-graph lanes for nodes listed newest first. Lane 0 is the main path.
+// Nodes are ordered by request start time, newest first. Replays attach to their
+// source for inspection but only a captured request moves the active branch.
+export function activeBranch(nodes) {
+  const parents = new Map(nodes.map(node => [node.id, node.parent]));
+  const active = new Set();
+  let id = nodes.find(node => node.entry_type === 'capture')?.id;
+  while (id != null && !active.has(id)) {
+    active.add(id);
+    id = parents.get(id);
+  }
+  return active;
+}
+
+// Git-graph lanes for nodes listed newest first. Lane 0 is the active branch.
 // Each row says which lanes pass through, which end at it, and whether its own
 // lane continues up (to a newer child) and down (to its parent).
-export function laneLayout(nodes) {
+export function laneLayout(nodes, active) {
   const lanes = [],
     rows = [];
   let width = 1;
@@ -14,7 +27,7 @@ export function laneLayout(nodes) {
     const waiting = [];
     lanes.forEach((id, i) => id === node.id && waiting.push(i));
     let lane;
-    if (node.main) lane = 0;
+    if (active.has(node.id)) lane = 0;
     else if (waiting.some((i) => i > 0)) lane = waiting.find((i) => i > 0);
     else {
       lane = lanes.findIndex((id, i) => i > 0 && id == null);

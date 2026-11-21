@@ -2,7 +2,7 @@ import { dshHost } from './dsh-host.js';
 import { outcomeWorker } from './gateway-outcome.js';
 import { createContinuations, replayAgentSettings, setReplayAgentPath } from './continue-agent.js';
 import { recoverCodexOutput } from './codex-reply.js';
-import { sessionTitles } from './session-titles.js';
+import { sessionGroupTitle, sessionTitles } from './session-titles.js';
 import { McpListener } from './mcp.js';
 import { timingSafeEqual, createHash, createHmac } from 'node:crypto';
 import { resolve, dirname } from 'node:path';
@@ -30,11 +30,13 @@ import { traceSearch } from './trace-search.js';
 import { requestPatch } from './request-diff.js';
 import { listFilter, pageRows, timeline } from './list-groups.js';
 import { requestHistory } from './ui/history-page.js';
+import { sendAgent, tabDispatches } from './mcp-repeater.js';
 
 const ui = resolve(dirname(fileURLToPath(import.meta.url)), 'ui');
 const digest = (v) => createHash('sha256').update(v).digest();
 const assets = new Map([
   ['/', 'index.html'],
+  ['/icon.png', '../page/icon.png'],
   ['/app.js', 'app.js'],
   ['/tab-save.js', 'tab-save.js'],
   ['/messages.js', 'messages.js'],
@@ -85,9 +87,23 @@ export function startService(options, overrides = {}) {
   const chats = () => (continuations ??= createContinuations(storage(), {
     port, upstream, uiKey: token, refreshAgents, host, ...overrides.continuations,
   }));
-  const mcp = new McpListener(token, upstream, captureState);
   const search = traceSearch(resolve(dataDir, 'traces.sqlite'));
   const sessionPages = traceSearch(resolve(dataDir, 'traces.sqlite'), 'tree');
+  async function models() {
+    const res = await fetch(new URL('/v1/models', upstream), {
+      headers: { Authorization: 'Bearer magpie-d-message' }, redirect: 'error', signal: AbortSignal.timeout(5000),
+    });
+    if (!res.ok) throw Error('Magpie model list returned HTTP ' + res.status);
+    const { data } = await res.json();
+    if (!Array.isArray(data)) throw Error('Invalid Magpie model list.');
+    return { models: data.filter(m => typeof m?.id === 'string' && m.id).map(m => {
+      const name = m.display_name || m.name || m.id;
+      const suffix = m.magpie_label?.startsWith(name + ' · ') && m.magpie_label.slice(name.length + 3);
+      const group = /^(auto|group)\//.test(m.id) || suffix === 'routing group' ? 'Routing groups' : suffix || m.owned_by || 'Other';
+      return { id: m.id, name, group };
+    }) };
+  }
+  const mcp = new McpListener(token, { upstream, captureState, titleFor, search, sessionPages, chats, models });
   const server = Bun.serve({
     port,
     hostname: '127.0.0.1',
@@ -177,6 +193,8 @@ export function startService(options, overrides = {}) {
           }));
         const chatStatus = /^\/api\/continue-status\/([\da-f-]{36})$/.exec(url.pathname);
         if (chatStatus && req.method === 'GET') {
+          const background = await chats().claudeStatus(chatStatus[1]);
+          if (background) return send(background);
           const row = db.query('SELECT state,error,tool_receipt AS toolReceipt FROM agent_chats WHERE id=?').get(chatStatus[1]);
           return row ? send(row) : send({ error: 'Chat no longer exists.' }, 404);
         }
@@ -184,26 +202,19 @@ export function startService(options, overrides = {}) {
         if (chatMatch && req.method === 'GET') return send(await chats().options(chatMatch[1]));
         if (chatMatch && req.method === 'POST') {
           const args = await req.json();
-          if (['dsh','codex'].includes(args.target)) server.timeout(req, 0);
+          if (['dsh','codex','claude'].includes(args.target)) server.timeout(req, 0);
+          if (args.tab_ref && !args.reopen) {
+            const receipt = await sendAgent({tab_ref:args.tab_ref,revision:args.revision,request_key:args.key,
+              target_agent:args.target,mode:'resend_prompt',
+              run_ref:chatMatch[1].startsWith('capture/') ? undefined : 'run:'+chatMatch[1]},chats,
+              path=>args.approvedFile===path);
+            if (receipt.error) return send({error:receipt.error,dispatchState:receipt.state},409);
+            return send({id:receipt.dispatch_ref.slice(9),state:receipt.state,sessionId:receipt.session_id,...(receipt.job && {job:receipt.job})},202);
+          }
           return send(await chats().start(chatMatch[1], args), 202);
         }
         if (req.method === 'GET' && url.pathname === '/api/models') {
-          const res = await fetch(new URL('/v1/models', upstream), {
-            headers: { Authorization: 'Bearer magpie-d-message' },
-            redirect: 'error',
-            signal: AbortSignal.timeout(5000),
-          });
-          if (!res.ok) return send({ error: 'Magpie model list returned HTTP ' + res.status }, 502);
-          const { data } = await res.json();
-          if (!Array.isArray(data)) return send({ error: 'Invalid Magpie model list.' }, 502);
-          const models = data.filter((m) => typeof m?.id === 'string' && m.id).map((m) => {
-            const name = m.display_name || m.name || m.id;
-            const suffix = m.magpie_label?.startsWith(name + ' · ') && m.magpie_label.slice(name.length + 3);
-            const group = /^(auto|group)\//.test(m.id) || suffix === 'routing group'
-              ? 'Routing groups' : suffix || m.owned_by || 'Other';
-            return { id: m.id, name, group };
-          });
-          return send({ models });
+          try { return send(await models()); } catch (error) { return send({error: error.message}, 502); }
         }
         if (url.pathname.startsWith('/api/tabs/')) {
           const action = url.pathname.slice('/api/tabs/'.length);
@@ -229,8 +240,13 @@ export function startService(options, overrides = {}) {
               ...tabRequest(action, { defer: url.searchParams.get('defer') === '1' }, upstream),
               splits: layoutPreferences(db),
             });
-          if (req.method === 'GET' && action === 'runs')
-            return send(tabRequest(action, { id: url.searchParams.get('id') }, upstream));
+          if (req.method === 'GET' && action === 'tab-index')
+            return send({active:db.query("SELECT value FROM settings WHERE key='repeater_active'").get()?.value,
+              tabs:db.query('SELECT id,name,revision,closed,source_ref FROM repeater_tabs ORDER BY rowid').all()});
+          if (req.method === 'GET' && action === 'runs') {
+            const id = url.searchParams.get('id');
+            return send({...tabRequest(action,{id},upstream),dispatches:tabDispatches(db,id)});
+          }
           if (req.method === 'POST' && !['workspace', 'runs'].includes(action))
             return send(tabRequest(action, await req.json(), upstream));
           return send({ error: 'Method not allowed' }, 405);
@@ -277,14 +293,10 @@ export function startService(options, overrides = {}) {
                 clearedThrough: clearedThrough(db),
                 ...pageRows(db, order, direction, args, offset),
               }))();
-          const firstPrompt = db.query(`SELECT last_preview FROM calls
-            WHERE agent IS ? AND session=? AND last_role='user' AND last_preview<>'' AND substr(last_preview,1,1)<>'<'
-            ORDER BY started,rowid LIMIT 1`);
           const latestCapture = db.query(`SELECT rowid AS seq FROM calls WHERE agent IS ? AND session=?
             ORDER BY started DESC,rowid DESC LIMIT 1`);
           await Promise.all(page.calls.filter(row => row.entry_type === 'session').map(async row => {
-            row.title = await titleFor(row.agent, row.session) ||
-              firstPrompt.get(row.agent, row.session)?.last_preview || row.latest.last_preview || '';
+            row.title = (await sessionGroupTitle(db, row, titleFor)) || '';
             // A new capture can move the active branch without matching the list filter.
             if (q || type || status)
               row.activitySeq = latestCapture.get(row.agent, row.session)?.seq;

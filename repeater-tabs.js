@@ -41,7 +41,7 @@ function insertTab(db, callId, ref, name, state, runView = null) {
   ).run(id, callId, ref, name, state, crypto.randomUUID(), runView);
   selectTab(db, id);
 }
-function openSource(db, ref) {
+function openSource(db, ref, duplicate = false) {
   if (typeof ref !== 'string' || !/^(trace|run):[a-f0-9-]{36}$/.test(ref))
     throw Error('Invalid source.');
   const existing = db
@@ -49,7 +49,7 @@ function openSource(db, ref) {
       'SELECT id FROM repeater_tabs WHERE source_ref=? ORDER BY closed IS NULL DESC, closed DESC, rowid LIMIT 1',
     )
     .get(ref);
-  if (existing) {
+  if (existing && !duplicate) {
     db.query('UPDATE repeater_tabs SET closed=NULL WHERE id=?').run(existing.id);
     selectTab(db, existing.id);
     return;
@@ -184,7 +184,7 @@ export function tabRequest(action, args, upstream) {
         setSetting(db, 'repeater_view', args.view);
         return {};
       }
-      if (action === 'open') openSource(db, args.ref);
+      if (action === 'open') openSource(db, args.ref, args.duplicate === true);
       else {
         const tab = db
           .query(

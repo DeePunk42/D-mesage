@@ -2,6 +2,15 @@ import { open } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+export async function sessionGroupTitle(db, row, titleFor) {
+  const name = await titleFor(row.agent, row.session);
+  if (name) return name;
+  const first = db.query(`SELECT last_preview FROM calls
+    WHERE agent IS ? AND session=? AND last_role='user' AND last_preview<>'' AND substr(last_preview,1,1)<>'<'
+    ORDER BY started,rowid LIMIT 1`).get(row.agent, row.session);
+  return first?.last_preview || row.latest.last_preview;
+}
+
 function titleIndex(path, apply) {
   let previous, offset = 0, names = new Map(), loading;
   async function refresh() {

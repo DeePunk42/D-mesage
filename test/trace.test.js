@@ -1,4 +1,4 @@
-import { test, expect, afterAll } from 'bun:test';
+import { test, expect, afterEach, afterAll } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -39,9 +39,17 @@ const probe = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Respo
 const port = probe.port;
 await probe.stop(true);
 const uiKey = crypto.randomUUID();
-const service = startService({ port, uiKey }, { upstream: mock.url.href });
+let pageService;
+function startPageService() {
+  pageService = startService({ port, uiKey }, { upstream: mock.url.href });
+  return pageService;
+}
+afterEach(async () => {
+  await pageService?.stop(true);
+  pageService = undefined;
+});
 const api = async (path, body) => {
-  const r = await fetch(service.url + 'api/' + path, {
+  const r = await fetch('http://127.0.0.1:' + port + '/api/' + path, {
     method: body === undefined ? 'GET' : 'POST',
     headers: { Authorization: 'Bearer ' + uiKey, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -49,7 +57,6 @@ const api = async (path, body) => {
   return [r.status, await r.json()];
 };
 afterAll(() => {
-  service.stop(true);
   mock.stop(true);
   storage().close();
   rmSync(process.env.D_MESSAGE_DATA_DIR, { recursive: true, force: true });
@@ -85,6 +92,7 @@ test('Codex reply recovery requires the matching local response ID and excludes 
   expect(await recoverCodexOutput({ ...call, reply: JSON.stringify(terminal) }, home)).toEqual([]);
 });
 test('two concurrent calls survive stop, individual runs retain the exact draft sent', async () => {
+  const service = startPageService();
   expect((await fetch(service.url + 'api/list')).status).toBe(401);
   const base = { model: 'mock', messages: [{ role: 'user', content: 'original' }], stream: false };
   const ctx = () => ({
@@ -172,6 +180,7 @@ test('two concurrent calls survive stop, individual runs retain the exact draft 
   expect(seen.every((r) => r.name === 'd-message/1')).toBe(true);
 });
 test('capture candidates use the gateway catalog and preserve manual additions and removals', async () => {
+  startPageService();
   const { gatewayAgents } = await import('../agent-catalog.js');
   const db = storage();
   const previous = (await api('capture-scope'))[1];
@@ -257,6 +266,7 @@ test('wire role and multipart previews preserve structure and literal JSON text'
 });
 
 test('HTTP MCP controls ports, snapshots, atomic patches and idempotent single-inference runs', async () => {
+  const service = startPageService();
   const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
   const { StreamableHTTPClientTransport } =
     await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
@@ -293,24 +303,21 @@ test('HTTP MCP controls ports, snapshots, atomic patches and idempotent single-i
   };
   try {
     expect((await client.listTools()).tools.map((t) => t.name).sort()).toEqual([
-      'trace_edit',
-      'trace_get',
-      'trace_list',
-      'trace_record',
-      'trace_repeat',
+      'recording','repeater_agent_options','repeater_cancel','repeater_dispatch_status','repeater_models',
+      'repeater_open','repeater_send_agent','repeater_send_model','repeater_tab','session_tree','trace_find','trace_read',
     ]);
     const scope = { agents: ['alpha', 'beta'] };
-    const configured = await result('trace_record', { action: 'configure', scope });
+    const configured = await result('recording', { action: 'configure', scope });
     expect(configured.recording).toBe(false);
     storage()
       .query("UPDATE settings SET value=? WHERE key='capture_scope'")
       .run(JSON.stringify({ ...scope, models: ['one'] }));
-    const status = await result('trace_record', { action: 'status' });
+    const status = await result('recording', { action: 'status' });
     expect(status.choices.agents).toContain('codex');
     expect(status.choices).not.toHaveProperty('models');
     expect(status.scope).toEqual(scope);
     expect((await api('capture-scope'))[1].scope).toEqual(scope);
-    const { cursor: beforeScope } = await result('trace_record', { action: 'start' });
+    const { cursor: beforeScope } = await result('recording', { action: 'start' });
     async function observe(agent, model, origin = 'local', protocol = 'chat') {
       const ctx = { agent, origin, protocol, state: {}, session: 'scope' };
       await onRequest({ model, messages: [] }, ctx);
@@ -328,21 +335,21 @@ test('HTTP MCP controls ports, snapshots, atomic patches and idempotent single-i
       (await observe('other-protocol', 'one', 'local', 'responses')).state.traceId,
     ).toBeUndefined();
     expect((await observe('gamma', 'missing', 'magpie-key')).state.traceId).toBeTruthy();
-    const filtered = await result('trace_list', { after: beforeScope });
-    expect(filtered.traces.map((r) => r.agent)).toEqual(['beta', 'alpha', 'gamma']);
-    expect((await result('trace_get', { ref: filtered.traces[0].ref })).value.agent).toBe('beta');
+    const filtered = await result('trace_find', { after_capture: beforeScope });
+    expect(filtered.records.map((r) => r.agent)).toEqual(['beta', 'alpha', 'gamma']);
+    expect((await result('trace_read', { ref: filtered.records[0].ref })).value.agent).toBe('beta');
     expect(
-      (await call('trace_record', { action: 'start', scope: { agents: [] } })).isError,
+      (await call('recording', { action: 'start', scope: { agents: [] } })).isError,
     ).toBe(true);
-    const reset = await result('trace_record', {
+    const reset = await result('recording', {
       action: 'start',
       scope: { agents: ['alpha-client'] },
     });
     expect(reset.scope.agents).toEqual(['alpha-client']);
-    await result('trace_record', { action: 'stop' });
+    await result('recording', { action: 'stop' });
     await onResponse({ choices: [] }, { ...accepted, success: true });
     expect((await api('calls/' + accepted.state.traceId))[1].status).toBe('complete');
-    const { cursor } = await result('trace_record', { action: 'start' });
+    const { cursor } = await result('recording', { action: 'start' });
     const ctx = {
       origin: 'local',
       agent: 'alpha-client',
@@ -356,14 +363,21 @@ test('HTTP MCP controls ports, snapshots, atomic patches and idempotent single-i
       stream: false,
     };
     await onRequest(body, ctx);
-    await result('trace_record', { action: 'stop' });
+    await result('recording', { action: 'stop' });
     await onResponse({ choices: [{ message: { content: 'ok' } }] }, { ...ctx, success: true });
-    const page = await result('trace_list', { after: cursor, session: 'mcp-test' });
-    expect(page.traces).toHaveLength(1);
-    expect((await result('trace_list', { after: page.cursor })).traces).toHaveLength(0);
-    const ref = page.traces[0].ref;
+    const page = await result('trace_find', { after_capture: cursor, session_id: 'mcp-test' });
+    expect(page.records).toHaveLength(1);
+    const grouped = await result('trace_find', { group_by: 'session', session_id: 'mcp-test' });
+    expect(grouped.records[0]).toMatchObject({ kind: 'session', session_title: 'hello' });
+    expect((await result('trace_find', { after_capture: page.cursor })).records).toHaveLength(0);
+    const ref = page.records[0].ref;
+    const tab = await result('repeater_open',{source_ref:ref});
+    const edit = {action:'edit',tab_ref:tab.tab_ref,revision:tab.revision};
+    const found = await result('trace_find',{query:'request:hello',session_id:'mcp-test'});
+    expect(found.records[0].hit.path).toBe('/messages/0/content');
+    expect((await result('session_tree',{agent:'alpha-client',session_id:'mcp-test'})).nodes[0].ref).toBe(ref);
     expect(
-      (await result('trace_get', { ref, view: 'request', path: '/messages/0/attributes/a~1b~0c' }))
+      (await result('trace_read', { ref, view: 'request', path: '/messages/0/attributes/a~1b~0c' }))
         .value,
     ).toBe(7);
     const ops = [
@@ -376,23 +390,25 @@ test('HTTP MCP controls ports, snapshots, atomic patches and idempotent single-i
     const before = count();
     expect(
       (
-        await call('trace_edit', {
-          ref,
+        await call('repeater_tab', {
+          ...edit,
           ops: [...ops, { op: 'test', path: '/messages/0/content', value: 'wrong' }],
         })
       ).isError,
     ).toBe(true);
     expect(count()).toBe(before);
-    const draft = (await result('trace_edit', { ref, ops })).draft_ref;
-    expect((await result('trace_get', { ref, view: 'request' })).value).toEqual(body);
+    const updated = await result('repeater_tab', { ...edit, ops });
+    expect((await call('repeater_tab',{...edit,ops})).isError).toBe(true);
+    expect((await result('repeater_tab',{tab_ref:tab.tab_ref,action:'read',view:'changes'})).value).toContain('@@');
+    expect((await result('trace_read', { ref, view: 'request' })).value).toEqual(body);
     const previousCalls = seen.length;
-    const args = { ref: draft, request_key: 'case-1' };
-    const [a, b] = await Promise.all([result('trace_repeat', args), result('trace_repeat', args)]);
+    const args = { tab_ref:tab.tab_ref,revision:updated.revision, request_key: 'case-1' };
+    const [a, b] = await Promise.all([result('repeater_send_model', args), result('repeater_send_model', args)]);
     expect(a.run_ref).toBe(b.run_ref);
-    expect((await call('trace_repeat', { ...args, ref })).isError).toBe(true);
+    expect((await call('repeater_send_model', { ...args, model:'other' })).isError).toBe(true);
     let record;
     for (let i = 0; i < 50; i++) {
-      record = await result('trace_get', { ref: a.run_ref, view: 'response' });
+      record = await result('trace_read', { ref: a.run_ref, view: 'response' });
       if (record.status === 'complete') break;
       await Bun.sleep(10);
     }
@@ -402,7 +418,7 @@ test('HTTP MCP controls ports, snapshots, atomic patches and idempotent single-i
       (await api('runs/' + ref.slice(6)))[1].runs.some((r) => r.id === a.run_ref.slice(4)),
     ).toBe(true);
     expect((await api('settings/mcp', { enabled: true, port }))[0]).toBe(400);
-    expect((await result('trace_record', { action: 'status' })).recording).toBe(false);
+    expect((await result('recording', { action: 'status' })).recording).toBe(false);
   } finally {
     await client.close();
   }
@@ -412,15 +428,11 @@ test('HTTP MCP controls ports, snapshots, atomic patches and idempotent single-i
   expect((await fetch(moved.url)).status).toBe(401);
   await expect(fetch(info.url)).rejects.toThrow();
   await service.stop(true);
-  const restarted = startService({ port, uiKey });
-  try {
-    expect((await api('settings/mcp'))[1].listening).toBe(true);
-    expect((await fetch(moved.url)).status).toBe(401);
-    await api('settings/mcp', { enabled: false, port: newPort });
-    await expect(fetch(moved.url)).rejects.toThrow();
-  } finally {
-    await restarted.stop(true);
-  }
+  startPageService();
+  expect((await api('settings/mcp'))[1].listening).toBe(true);
+  expect((await fetch(moved.url)).status).toBe(401);
+  await api('settings/mcp', { enabled: false, port: newPort });
+  await expect(fetch(moved.url)).rejects.toThrow();
 });
 
 test('a new plugin host recovers page and MCP listeners after an overlapping restart', async () => {
@@ -496,7 +508,8 @@ test('pretty text edits preserve untouched encodings and JSON token spelling', a
 });
 
 test('clear requires confirmation and preserves capture scope and polling cursors', async () => {
-  const { recordState, editTrace, listTraces } = await import('../trace-api.js');
+  const { recordState } = await import('../trace-api.js');
+  const { findTraces } = await import('../mcp-traces.js');
   const server = startService({ port, uiKey }, { upstream: mock.url.href, restoreMcp: false });
   try {
     const scope = { agents: ['clear-test'] };
@@ -505,7 +518,11 @@ test('clear requires confirmation and preserves capture scope and polling cursor
     const body = { model: 'mock', messages: [{ role: 'user', content: 'test' }] };
     await onRequest(body, ctx);
     const callId = ctx.state.traceId;
-    const { draft_ref } = editTrace({ ref: 'trace:' + callId, ops: [] });
+    // Older releases stored unsent MCP drafts as standalone experiments.
+    const legacyDraft = crypto.randomUUID();
+    storage().query('INSERT INTO experiments(id,call_id,created,body) VALUES(?,?,?,?)')
+      .run(legacyDraft, callId, Date.now(), JSON.stringify(body));
+    expect((await api('snapshot/' + legacyDraft))[0]).toBe(200);
     const before = recordState('status');
     const [denied] = await api('history/clear', { confirmed: false });
     expect(denied).toBe(400);
@@ -521,14 +538,14 @@ test('clear requires confirmation and preserves capture scope and polling cursor
     const [status, cleared] = await api('history/clear', { confirmed: true });
     expect(status).toBe(200);
     expect(cleared.clearedThrough).toBe(before.cursor);
-    expect((await api('snapshot/' + draft_ref.slice(6)))[0]).toBe(404);
+    expect((await api('snapshot/' + legacyDraft))[0]).toBe(404);
     await onResponse({ choices: [] }, { ...ctx, success: true });
     expect((await api('list'))[1].total).toBe(0);
     expect(recordState('status')).toMatchObject({ cursor: before.cursor, recording: true, scope });
     const next = { ...ctx, state: {} };
     await onRequest(body, next);
-    const events = listTraces({ after: before.cursor });
-    expect(events.traces.map((r) => r.ref)).toEqual(['trace:' + next.state.traceId]);
+    const events = await findTraces({ after_capture: before.cursor }, {});
+    expect(events.records.map((r) => r.ref)).toEqual(['trace:' + next.state.traceId]);
     expect(events.cursor).toBeGreaterThan(before.cursor);
   } finally {
     await server.stop(true);
@@ -611,7 +628,8 @@ test('persistent tabs isolate runs, reject stale saves and keep Trace history af
 });
 
 test('Responses and Messages retain their native bodies, routes and edited tab snapshots', async () => {
-  const { recordState, snapshot, editTrace, repeatTrace } = await import('../trace-api.js');
+  const { recordState, snapshot } = await import('../trace-api.js');
+  const { openTab, repeaterTab, sendModel } = await import('../mcp-repeater.js');
   const { tabRequest } = await import('../repeater-tabs.js');
   const { requestEntries, responseMessages } = await import('../ui/protocols.js');
   const output = [
@@ -739,11 +757,12 @@ test('Responses and Messages retain their native bodies, routes and edited tab s
       expect(nativeCalls.at(-1).body).toEqual(replayBody);
       if (protocol === 'anthropic')
         expect(nativeCalls.at(-1).headers.get('anthropic-version')).toBe('2023-06-01');
-      const d = editTrace({ ref, ops: [{ op: 'replace', path: '/' + key, value: edit[key] }] });
-      run = repeatTrace(
-        { ref: d.draft_ref, request_key: crypto.randomUUID() },
-        upstream,
-      ).run_ref.slice(4);
+      const mcpTab = openTab({ source_ref: ref, duplicate: true });
+      const editedTab = repeaterTab({
+        action: 'edit', tab_ref: mcpTab.tab_ref, revision: mcpTab.revision,
+        ops: [{ op: 'replace', path: '/' + key, value: edit[key] }],
+      });
+      run = sendModel({ ...editedTab, request_key: crypto.randomUUID() }, upstream).run_ref.slice(4);
       await completed(run);
       expect(nativeCalls.at(-1).body).toEqual(edit);
       expect(nativeCalls.at(-1).path).toBe(path);
@@ -965,7 +984,8 @@ test('session history pages newest first and exposes request and reply separatel
 });
 
 test('tabs and MCP share eight slots, queue snapshots in order and cancel only waiting runs', async () => {
-  const { recordState, repeatTrace, snapshot } = await import('../trace-api.js');
+  const { recordState, snapshot } = await import('../trace-api.js');
+  const { sendModel } = await import('../mcp-repeater.js');
   const arrived = [],
     held = new Map();
   let peak = 0;
@@ -1011,10 +1031,10 @@ test('tabs and MCP share eight slots, queue snapshots in order and cancel only w
     for (let i = 0; i < 7; i++) originals.push(await sendTab(tab));
     originals.push(await sendTab(copy));
     await until(() => held.size === 8);
-    const key = { ref, request_key: crypto.randomUUID() };
-    const ninth = repeatTrace(key, upstream);
+    const key = { tab_ref: 'tab:' + tab.id, revision: tab.revision, request_key: crypto.randomUUID() };
+    const ninth = sendModel(key, upstream);
     expect(ninth.status).toBe('queued');
-    expect(repeatTrace(key, upstream)).toEqual(ninth);
+    expect(sendModel(key, upstream)).toEqual(ninth);
     const mcpId = ninth.run_ref.slice(4);
     const tenth = await sendTab(tab);
     const canceled = await sendTab(copy);
@@ -1183,13 +1203,13 @@ test('continuations bind the selected run, require a reviewed file and deliver t
       detect: () => '/bin/true',
       platform: 'darwin',
     });
-    const opts = await chats.options(run);
+    const opts = await chats.options(run,undefined,'continue_from_reply');
     expect(opts.original).toBe('claude');
     expect(opts.read).toBe(file);
     expect(opts.targets.find((t) => t.id === 'claude').reason).toBe('');
     db.query('UPDATE calls SET agent=? WHERE id=?').run('artex', call);
     try {
-      const other = await chats.options(run);
+      const other = await chats.options(run,undefined,'continue_from_reply');
       expect(other.original).toBe('artex');
       expect(other.targets.every(({ id }) => ['claude', 'codex', 'dsh'].includes(id))).toBe(true);
       await expect(chats.start(run, { target: 'artex', key })).rejects.toThrow('Unsupported continuation target');
@@ -1197,12 +1217,10 @@ test('continuations bind the selected run, require a reviewed file and deliver t
     } finally {
       db.query('UPDATE calls SET agent=? WHERE id=?').run('claude', call);
     }
-    await expect(chats.start(run, { target: 'claude', key })).rejects.toThrow('Review');
-    await expect(chats.start(run, { target: 'codex', key, approvedFile: file })).rejects.toThrow(
-      'protocol',
-    );
+    await expect(chats.start(run, { target: 'claude', mode:'continue_from_reply', key })).rejects.toThrow('Review');
+    expect((await chats.options('capture/' + call, edited)).targets.find(t=>t.id==='codex').reason).toBe('');
     await Promise.all(
-      [1, 2].map(() => chats.start(run, { target: 'claude', key, approvedFile: file })),
+      [1, 2].map(() => chats.start(run, { target: 'claude', mode:'continue_from_reply', key, approvedFile: file })),
     );
     expect(opens).toBe(1);
     const chat = db.query('select * from agent_chats where id=?').get(key);
@@ -1235,12 +1253,24 @@ test('continuations bind the selected run, require a reviewed file and deliver t
     expect(wire.max_tokens).toBe(800);
     expect(modelCalls).toBe(1);
     expect(wireHeaders.get('x-api-key')).toBe('magpie-d-message');
-    expect((await chats.options(run)).targets.find((t) => t.id === 'claude').reopen).toBe(key);
+    expect((await chats.options(run,undefined,'continue_from_reply')).targets.find((t) => t.id === 'claude').reopen).toBe(key);
     expect(await chats.start(run, { target: 'claude', reopen: key })).toEqual({
       id: key,
       state: 'reopened',
     });
     expect(opens).toBe(2);
+    const {openTab, sendAgent, agentOptions, dispatchStatus} = await import('../mcp-repeater.js');
+    const tab = openTab({source_ref:'run:'+run});
+    const handoff = {...tab,run_ref:'run:'+run,target_agent:'claude',mode:'continue_from_reply',request_key:'claude-handoff'};
+    const available = await agentOptions(handoff,()=>chats);
+    expect(available.targets.find(t=>t.target_agent==='claude').review_file).toBe(file);
+    await expect(sendAgent(handoff,()=>chats,()=>false)).rejects.toThrow('File review required');
+    expect(opens).toBe(2);
+    const handed = await sendAgent(handoff,()=>chats,name=>name===file);
+    expect(handed.state).toBe('opening');
+    expect(await sendAgent(handoff,()=>chats,()=>false)).toEqual(handed);
+    expect(dispatchStatus(handed)).toEqual(handed);
+    expect(opens).toBe(3);
     await expect(chats.start(run, { target: 'dsh', reopen: key })).rejects.toThrow('reopened');
     db.query('DELETE FROM runs WHERE id=?').run(run);
     expect((await ask(seed, h)).status).toBe(410);
@@ -1407,6 +1437,31 @@ test('DSH resends the edited user input in the existing Host branch and retries 
   expect(prompts.at(-1).content).toEqual([{type:'text',text:'Unsent DSH draft'}]);
   await expect(chats.start(ref,{...direct, request:original})).rejects.toThrow('different request');
   expect(db.query('SELECT count(*) AS n FROM experiments WHERE call_id=?').get(fresh).n).toBe(0);
+  const {openTab,repeaterTab,sendAgent,dispatchStatus} = await import('../mcp-repeater.js');
+  const tab = openTab({source_ref:'trace:'+fresh});
+  const editedTab = repeaterTab({...tab,action:'edit',ops:[{op:'replace',path:'/messages/0/content',value:'Shared tab prompt'}]});
+  const delivery = {...editedTab,target_agent:'dsh',mode:'resend_prompt',request_key:'dsh-native-prompt'};
+  const forksBefore = forks.length;
+  const submitted = await sendAgent(delivery,()=>chats);
+  expect(submitted).toMatchObject({state:'accepted',session_id:'session-child'});
+  expect(prompts.at(-1).content[0].text).toBe('Shared tab prompt');
+  expect(await sendAgent(delivery,()=>chats)).toEqual(dispatchStatus(submitted));
+  expect(forks.length).toBe(forksBefore+1);
+  expect(repeaterTab({...tab,action:'read',view:'runs'}).value).toMatchObject({runs:[],dispatches:[submitted]});
+  await expect(sendAgent({...delivery,mode:'continue_from_reply'},()=>chats)).rejects.toThrow('do not match');
+  const pendingRoot = join(dataDir,'dsh-pending-sessions');
+  const pendingFolder = join(pendingRoot,'project','session-parent');
+  mkdirSync(pendingFolder,{recursive:true});
+  const pendingEvents = events.filter(e => e.type !== 'assistant/message').map(e =>
+    ({ ...e, time: 100 + (e.seq || 0) }));
+  pendingEvents.splice(pendingEvents.findIndex(e=>e.type==='turn/start')+1,0,
+    {type:'step/start',seq:2,time:102,data:{}});
+  writeFileSync(join(pendingFolder,'session.v4.jsonl'),pendingEvents.map(e=>JSON.stringify(e)).join('\n'));
+  const noReply = { ...row, body:JSON.stringify(edited), source_reply:null, source_started:104 };
+  expect(await locateDshPrompt(noReply,pendingRoot)).toEqual({
+    sessionId:'session-parent',atSeq:0,content:[{type:'text',text:'Edited question'}]
+  });
+  await expect(locateDshPrompt({...noReply,source_started:999},pendingRoot)).rejects.toThrow('locate');
   const duplicate = join(root, 'other', 'session-other');
   mkdirSync(duplicate, { recursive: true });
   const duplicateFile = join(duplicate, 'session.v4.jsonl');
@@ -1424,5 +1479,90 @@ test('DSH resends the edited user input in the existing Host branch and retries 
   await expect(chats.start(run, { target: 'dsh', key: crypto.randomUUID() })).rejects.toThrow(
     'uniquely',
   );
-  expect(forks.length).toBe(3);
+  expect(forks.length).toBe(forksBefore+1);
+});
+
+test('every fresh Repeater capture offers all three agents; cross-client sends contain only the current text', async () => {
+  const {Database}=await import('bun:sqlite');
+  const {createContinuations} = await import('../continue-agent.js');
+  const workspaceRoot=mkdtempSync(join(tmpdir(),'dmessage-fresh-targets-'));
+  const db = new Database(':memory:');
+  db.exec(`CREATE TABLE calls(id TEXT,agent TEXT,protocol TEXT,session TEXT,request TEXT,reply TEXT,started INTEGER);
+    CREATE TABLE claude_dispatches(id TEXT PRIMARY KEY,call_id TEXT,digest TEXT,cwd TEXT,stage TEXT,child TEXT,job TEXT,prompt TEXT);
+    CREATE TABLE codex_dispatches(id TEXT PRIMARY KEY,call_id TEXT,digest TEXT,stage TEXT,input TEXT,child TEXT);
+    CREATE TABLE dsh_dispatches(id TEXT PRIMARY KEY,call_id TEXT,digest TEXT,origin TEXT,plan TEXT,child TEXT,state TEXT,error TEXT);
+    CREATE TABLE agent_chats(id TEXT,run_id TEXT,target TEXT,base TEXT,marker TEXT,workdir TEXT,state TEXT,native_id TEXT,error TEXT);
+    CREATE TABLE runs(id TEXT,experiment_id TEXT);CREATE TABLE experiments(id TEXT,call_id TEXT,body TEXT);`);
+  const sent = [],
+    child = crypto.randomUUID();
+  const chats = createContinuations(db, {
+    workspaceRoot,
+    detect: () => '/fixture',
+    platform: 'darwin',
+    host: {
+      client: () => ({
+        origin: 'http://127.0.0.1:99',
+        create: async (_cwd, id) => ({ sessionId: id }),
+        prompt: async (p) => {
+          sent.push(['dsh', p.content[0].text]);
+          return { accepted: true };
+        },
+      }),
+    },
+    claudeRuntime: {
+      startJob: async (_exe, _cwd, id, p) => {
+        expect(id).toBeNull();
+        sent.push(['claude', p]);
+        return 'bg';
+      },
+      jobSession: async () => child,
+    },
+    codexServer: async (_exe, cb) =>
+      cb(async (m, p) => {
+        if (m === 'thread/start') return { thread: { id: child } };
+        if (m === 'thread/name/set') return {};
+        if (m === 'thread/queue/add') {
+          sent.push(['codex', p.input[0].text]);
+          return { queuedSubmission: p };
+        }
+        throw Error(m);
+      }),
+    openCodex: async () => {},
+  });
+  for (const source of ['claude', 'dsh', 'codex', 'custom']) {
+    const ref = crypto.randomUUID(),
+      protocol = source === 'codex' ? 'responses' : 'anthropic',
+      key = source === 'codex' ? 'input' : 'messages';
+    const body = {
+      [key]: [
+        { role: 'user', content: 'old question' },
+        { role: 'assistant', content: 'historical answer' },
+        { role: 'user', content: 'replace me' },
+      ],
+    };
+    db.query('INSERT INTO calls VALUES(?,?,?,?,?,?,0)').run(
+      ref,
+      source,
+      protocol,
+      crypto.randomUUID(),
+      JSON.stringify(body),
+      '{"content":[{"type":"text","text":"never send this reply"}]}',
+    );
+    const edited = structuredClone(body);
+    edited[key][2].content = 'current ' + source;
+    const opts = await chats.options('capture/' + ref, edited);
+    expect(opts.targets.map((t) => t.id).sort()).toEqual(['claude', 'codex', 'dsh']);
+    for (const target of opts.targets.filter((t) => t.id !== source)) {
+      expect(target.reason).toBe('');
+      await chats.start('capture/' + ref, {
+        target: target.id,
+        request: edited,
+        key: crypto.randomUUID(),
+      });
+      expect(sent.at(-1)).toEqual([target.id, 'current ' + source]);
+    }
+  }
+  expect(db.query('select count(*) as n from runs').get().n).toBe(0);
+  db.close();
+  rmSync(workspaceRoot,{recursive:true,force:true});
 });

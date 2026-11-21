@@ -5,12 +5,13 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta name="color-scheme" content="light dark" />
     <title>D-message</title>
+    <link rel="icon" type="image/png" href="icon.png" />
     <link rel="stylesheet" href="style.css" />
     <script type="module" src="app.js"></script>
   </head>
   <body>
     <header>
-      <h1><svg aria-hidden="true" viewBox="0 0 32 32"><path d="M8 8h9a7 7 0 0 1 0 14h-4l-5 4V8Z"/><path d="M13 13h7m-7 4h4"/></svg>D-message</h1>
+      <h1><img src="icon.png" alt="" width="32" height="32" />D-message</h1>
       <nav aria-label="Workspaces">
         <button id="toTrace" aria-pressed="true">Trace</button
         ><button id="toRepeat" aria-pressed="false">Repeater</button
@@ -254,6 +255,7 @@
             </div>
             <div id="runView" class="viewport"></div>
             <small id="runMeta"></small>
+            <details id="agentDeliveries" hidden><summary>Agent deliveries</summary></details>
           </section>
         </div>
       </section>

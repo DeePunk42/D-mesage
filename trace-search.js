@@ -1,6 +1,6 @@
 import { Worker, parentPort, workerData } from 'node:worker_threads';
 import { Database } from 'bun:sqlite';
-import { searchConditions, rankedHits } from './ui/search.js';
+import { searchConditions, rankedHits, pointer } from './ui/search.js';
 import { searchTurnBounds, sessionTree } from './session-tree.js';
 import { groupRows } from './list-groups.js';
 
@@ -67,6 +67,10 @@ if (parentPort && workerData?.path) {
         const clearedThrough = Number(version?.value || 0);
         const rows = db.query(options.sql).iterate(...options.args);
         for (const row of rows) {
+          if (!conditions.length) {
+            matched.push(row);
+            continue;
+          }
           const stamp = row.status + '|' + row.ended;
           let match = matches.get(row.id);
           if (match?.stamp !== stamp) {
@@ -98,8 +102,24 @@ if (parentPort && workerData?.path) {
           if (!match.found) continue;
           matched.push({ ...row, hit: match.hit ?? null });
         }
-        const entries = groupRows(matched);
-        const calls = entries.slice(options.offset, options.offset + 100);
+        const entries = options.flat ? matched : groupRows(matched);
+        const calls = entries.slice(options.offset, options.offset + (options.limit ?? 100));
+        if (options.flat && options.hitLimit && conditions.length) for (const row of calls) {
+          const raw = (row.entry_type === 'capture' ? capture : replay).get(row.id);
+          const request = JSON.parse(raw.request), response = JSON.parse(raw.reply);
+          row.hits = [];
+          let index = 0;
+          outer: for (const query of conditions) {
+            for (const hit of rankedHits(request,response,query,row.hit?.kept)) {
+              if (index++ < options.hitOffset) continue;
+              if (row.hits.length === options.hitLimit) {
+                row.next_hit_offset = index - 1;
+                break outer;
+              }
+              row.hits.push({side:hit.side,path:hit.path.length ? pointer(hit.path) : '',preview:hit.preview});
+            }
+          }
+        }
         return {
           calls,
           total: entries.length,

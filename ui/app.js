@@ -21,7 +21,6 @@ import {
   blockData,
   highlightedEditor,
   jsonTree,
-  showText,
   messageCard,
   sectionTitle,
   pretty,
@@ -115,7 +114,7 @@ async function api(path, body, keepalive = false, signal) {
     signal,
   });
   const data = await res.json();
-  if (!res.ok) throw Error(data.error || 'Request failed');
+  if (!res.ok) throw Object.assign(Error(data.error || 'Request failed'), { dispatchState: data.dispatchState });
   return data;
 }
 let preferenceWrites = Promise.resolve();
@@ -1258,7 +1257,7 @@ function resetHistory(cursor) {
   selectionController?.abort();
   detachHistory($('inspectView'));
   selected = source = draft = cleanDraft = snapshot = field = null;
-  viewContinuation(null, null);
+  viewContinuation(null);
   dirty = typing = false;
   rows = [];
   rowIndex.clear();
@@ -1316,12 +1315,12 @@ function agentIcon(id) {
 const { view: viewContinuation, refresh: refreshContinuations } = continuePicker({
   root: $('continueControls'), menu: $('continueMenu'), choices: $('continueChoices'),
   launch: $('continueAgent'), message: $('continueMessage'), api, agentIcon, agentName,
+  savedRevision: () => writer.flush(),
   currentRequest: () => {
     if (field?.error) throw Error(field.error);
     if (!draft) throw Error('No request draft is open.');
     return draft;
   },
-  confirmRead: (id, path) => confirmAction('This run asks ' + agentName(id) + ' to read this file and send its contents to the run model: ' + path, 'Continue with file read'),
 });
 function paintScope(agents) {
   const summary = $('scopeSummary');
@@ -1645,7 +1644,7 @@ async function installWorkspace(data, view) {
   writer = null;
   if (source) tabUndo.set(source.id, { undoStack, redoStack });
   source = data.tab;
-  viewContinuation(source, null);
+  viewContinuation(source);
   snapshot = null;
   runs = [];
   saved = [];
@@ -1698,6 +1697,7 @@ async function installWorkspace(data, view) {
     $('draftView').replaceChildren();
   }
   paintTabStrip(data.tabs);
+  $('agentDeliveries').hidden = true;
   $('tabMenu').open = false;
   setWorkspace(view);
   if (source && view === 'repeater') {
@@ -2260,7 +2260,6 @@ function chooseRunView(view) {
   paintRun();
 }
 function paintRun() {
-  viewContinuation(source, snapshot);
   const inSnapshot = runView.tab === 'Request snapshot';
   $('replyTitle').textContent = runView.tab;
   $('backToReply').hidden = !inSnapshot;
@@ -2302,6 +2301,14 @@ async function updateRuns(force = false) {
   if (epoch !== runEpoch || source?.id !== id) return;
   runs = d.runs;
   saved = d.drafts;
+  const receipts = d.dispatches || [];
+  const history = $('agentDeliveries');
+  history.hidden = !receipts.length;
+  if (receipts.length && history.dataset.items !== JSON.stringify(receipts)) {
+    history.dataset.items = JSON.stringify(receipts);
+    history.replaceChildren(el('summary','Agent deliveries · '+receipts.length),
+      ...receipts.map(r=>el('p',[time(r.created),agentName(r.target_agent),r.state,r.session_id,r.error].filter(Boolean).join(' · '))));
+  }
   const opts = [
     ['original', kind === 'run' ? 'Source replay' : 'Original capture'],
     ...runs
@@ -2347,7 +2354,6 @@ async function send() {
     const r = await api('tabs/send', { id, revision });
     if (source?.id === id) {
       runId = r.id;
-      viewContinuation(source, null);
       snapshot = null;
       if (runView.tab !== 'Reply') chooseRunView({ tab: 'Reply' });
       else paintRun();
@@ -2638,7 +2644,19 @@ async function poll() {
   try {
     if (workspace === 'trace') await list();
     else paintRecording(await api('recording'));
-    if (workspace === 'repeater' && source && !posting) await updateRuns();
+    if (workspace === 'repeater' && !posting && !switching) {
+      const current = source;
+      const index = await api('tabs/tab-index');
+      if (workspace === 'repeater' && !switching && !posting && current === source) {
+        const remote = index.tabs.find(t=>t.id===index.active && t.closed===null);
+        const changed = remote?.id !== source?.id || remote?.revision !== writer?.revision;
+        if (changed && (!writer || writer.settled) && !field) {
+          const data = await api('tabs/workspace');
+          if (workspace === 'repeater' && !posting && !switching && current === source && (!writer || writer.settled) && !field)
+            await installWorkspace(data,'repeater');
+        } else if (source) await updateRuns();
+      }
+    }
   } catch (e) {
     explain(e);
   }

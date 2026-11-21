@@ -1,5 +1,5 @@
 import { endpointFor } from './ui/protocols.js';
-import { requestPreview } from './ui/messages.js';
+import { requestPreview, previewTools } from './ui/messages.js';
 import { finalPreview } from './ui/response-items.js';
 import { sessionRowId } from './ui/session-graph.js';
 import { Database } from 'bun:sqlite';
@@ -46,6 +46,9 @@ export function storage() {
       id TEXT PRIMARY KEY,run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,target TEXT NOT NULL,
       state TEXT NOT NULL,base TEXT NOT NULL,workdir TEXT NOT NULL,marker TEXT NOT NULL,error TEXT,
       access_key TEXT,native_id TEXT,owner INTEGER,approved_command TEXT,tool_receipt TEXT);
+    CREATE TABLE IF NOT EXISTS claude_dispatches(
+      id TEXT PRIMARY KEY,call_id TEXT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,digest TEXT NOT NULL,
+      cwd TEXT NOT NULL,stage TEXT NOT NULL,child TEXT,job TEXT,prompt TEXT);
     CREATE TABLE IF NOT EXISTS dsh_dispatches(
       id TEXT PRIMARY KEY,call_id TEXT NOT NULL REFERENCES calls(id) ON DELETE CASCADE,
       digest TEXT NOT NULL,origin TEXT NOT NULL,plan TEXT NOT NULL,child TEXT,state TEXT NOT NULL,error TEXT);
@@ -60,13 +63,21 @@ export function storage() {
       name TEXT NOT NULL, closed INTEGER, revision TEXT NOT NULL, state TEXT NOT NULL,
       selected_run TEXT NOT NULL DEFAULT 'original', run_view TEXT);
     CREATE INDEX IF NOT EXISTS tabs_source ON repeater_tabs(source_ref);
+    CREATE TABLE IF NOT EXISTS tab_dispatches(
+      id TEXT PRIMARY KEY,tab_id TEXT NOT NULL REFERENCES repeater_tabs(id) ON DELETE CASCADE,
+      request_key TEXT UNIQUE NOT NULL,signature TEXT NOT NULL,target TEXT NOT NULL,mode TEXT NOT NULL,
+      state TEXT NOT NULL,error TEXT,created INTEGER NOT NULL,owner INTEGER);
     CREATE TABLE IF NOT EXISTS repeat_keys(request_key TEXT PRIMARY KEY, source_ref TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(id));
     CREATE TABLE IF NOT EXISTS call_chain(
       call_id TEXT PRIMARY KEY REFERENCES calls(id) ON DELETE CASCADE, version INTEGER NOT NULL, chain BLOB NOT NULL);
     PRAGMA foreign_keys=ON;`);
   db.transaction(() => {
+    if (!db.query('PRAGMA table_info(tab_dispatches)').all().some(column => column.name === 'owner'))
+      db.exec('ALTER TABLE tab_dispatches ADD COLUMN owner INTEGER');
     if (!db.query('PRAGMA table_info(repeater_tabs)').all().some((column) => column.name === 'run_view'))
       db.exec('ALTER TABLE repeater_tabs ADD COLUMN run_view TEXT');
+    if (!db.query('PRAGMA table_info(claude_dispatches)').all().some(c => c.name === 'prompt'))
+      db.exec('ALTER TABLE claude_dispatches ADD COLUMN prompt TEXT');
     const chatColumns = db.query('PRAGMA table_info(agent_chats)').all().map(c => c.name);
     for (const [name, type] of [['access_key','TEXT'], ['native_id','TEXT'], ['owner','INTEGER'], ['approved_command','TEXT'], ['tool_receipt','TEXT']]) {
       if (!chatColumns.includes(name)) db.exec('ALTER TABLE agent_chats ADD COLUMN ' + name + ' ' + type);
@@ -104,9 +115,12 @@ export function storage() {
     if (!runColumns.includes('last_preview'))
       db.exec('ALTER TABLE runs ADD COLUMN last_preview TEXT');
     for (const [table, names] of [['calls', columns], ['runs', runColumns]]) {
+      if (!names.includes('request_tools')) db.exec(`ALTER TABLE ${table} ADD COLUMN request_tools TEXT`);
+      if (!names.includes('response_tools')) db.exec(`ALTER TABLE ${table} ADD COLUMN response_tools TEXT`);
       if (!names.includes('final_preview')) db.exec('ALTER TABLE ' + table + ' ADD COLUMN final_preview TEXT');
       if (!names.includes('preview_version')) db.exec('ALTER TABLE ' + table + ' ADD COLUMN preview_version INTEGER NOT NULL DEFAULT 0');
       db.exec('CREATE INDEX IF NOT EXISTS ' + table + '_old_previews ON ' + table + '(preview_version) WHERE preview_version=0');
+      db.exec(`CREATE INDEX IF NOT EXISTS ${table}_missing_tools ON ${table}(started) WHERE request_tools IS NULL`);
     }
     // Trace metadata stays in small covering indexes, apart from the wire bodies.
     db.exec(`CREATE INDEX IF NOT EXISTS calls_list ON calls(
@@ -128,16 +142,18 @@ export function backfillPreviews(limit = 12, db = storage()) {
   let remaining = limit;
   for (const table of ['calls', 'runs']) {
     const rows = db.query(table === 'calls'
-      ? 'SELECT id,protocol,request,reply,ended FROM calls WHERE preview_version=0 ORDER BY rowid DESC LIMIT ?'
+      ? 'SELECT id,protocol,request,reply,ended FROM calls WHERE preview_version=0 OR request_tools IS NULL ORDER BY rowid DESC LIMIT ?'
       : `SELECT r.id,c.protocol,CASE WHEN r.kind='baseline' THEN c.request ELSE e.body END AS request,
           r.reply,r.ended FROM runs r JOIN experiments e ON e.id=r.experiment_id JOIN calls c ON c.id=e.call_id
-          WHERE r.preview_version=0 ORDER BY r.rowid DESC LIMIT ?`).all(remaining);
+          WHERE r.preview_version=0 OR r.request_tools IS NULL ORDER BY r.rowid DESC LIMIT ?`).all(remaining);
     const updates = rows.map(row => {
-      const summary = requestPreview(row.protocol, JSON.parse(row.request));
-      return [summary.role, summary.text, finalPreview(JSON.parse(row.reply)), row.id, row.ended];
+      const body = JSON.parse(row.request), reply = JSON.parse(row.reply);
+      const summary = requestPreview(row.protocol, body);
+      return [summary.role, summary.text, finalPreview(reply),JSON.stringify(previewTools(row.protocol,body)),
+        JSON.stringify(previewTools(row.protocol,null,reply)), row.id, row.ended];
     });
     if (updates.length) {
-      const update = db.query('UPDATE ' + table + ' SET last_role=?,last_preview=?,final_preview=?,preview_version=1 WHERE id=? AND ended IS ? AND preview_version=0');
+      const update = db.query('UPDATE ' + table + ' SET last_role=?,last_preview=?,final_preview=?,request_tools=?,response_tools=?,preview_version=1 WHERE id=? AND ended IS ? AND (preview_version=0 OR request_tools IS NULL)');
       db.transaction(() => { for (const values of updates) update.run(...values); }).immediate();
     }
     remaining -= rows.length;
@@ -275,8 +291,8 @@ export function startCall(body, session, agent, protocol = 'chat', path) {
       const id = crypto.randomUUID(),
         last = requestPreview(protocol, body);
       db.query(
-        `INSERT INTO calls(rowid,id,session,agent,model,started,status,request,owner,last_role,last_preview,protocol,endpoint,preview_version)
-      VALUES(?,?,?,?,?,?,'pending',?,?,?,?,?,?,1)`,
+        `INSERT INTO calls(rowid,id,session,agent,model,started,status,request,owner,last_role,last_preview,protocol,endpoint,preview_version,request_tools)
+      VALUES(?,?,?,?,?,?,'pending',?,?,?,?,?,?,1,?)`,
       ).run(
         captureCursor(db) + 1,
         id,
@@ -290,6 +306,7 @@ export function startCall(body, session, agent, protocol = 'chat', path) {
         last.text,
         protocol,
         endpointFor(protocol, path),
+        JSON.stringify(previewTools(protocol,body)),
       );
       return id;
     })
@@ -304,12 +321,12 @@ export function endCall(id, reply, success, protocol = 'chat') {
   else status = success === true ? 'complete' : 'checking_unknown';
   const updated = storage()
     .query(
-      `UPDATE calls SET ended=?,status=?,reply=?,final_preview=?,failure=? WHERE id=? AND
+      `UPDATE calls SET ended=?,status=?,reply=?,final_preview=?,failure=?,response_tools=? WHERE id=? AND
         (status IN ('pending','checking_unknown','unconfirmed') OR
         (reply IS NULL AND (status='complete' OR (status IN ('incomplete','failed','canceled') AND ended IS NULL))))`,
     )
     .run(Date.now(), status, reply == null ? null : JSON.stringify(reply), finalPreview(reply),
-      direct ? JSON.stringify(direct.failure) : null, id);
+      direct ? JSON.stringify(direct.failure) : null,JSON.stringify(previewTools(protocol,null,reply)), id);
   if (updated.changes && status.startsWith('checking')) outcomeEvents.dispatchEvent(new Event('checking'));
 }
 

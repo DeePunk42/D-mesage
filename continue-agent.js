@@ -21,7 +21,9 @@ import {
   targetReason,
   forTarget,
 } from './continue-protocol.js';
-import { codexDispatcher, codexRequestDigest, codexSource, openCodexThread } from './codex-dispatch.js';
+import { draftPrompt, newChatWorkspace } from './agent-prompt.js';
+import { claudeDispatcher, claudeJobStatus, claudePrompt } from './claude-dispatch.js';
+import { codexChange, codexDispatcher, codexRequestDigest, codexSource, openCodexThread } from './codex-dispatch.js';
 import { editedDshPrompt, dshResender } from './dsh-prompt.js';
 import { dshHost } from './dsh-host.js';
 import { endpointFor } from './ui/protocols.js';
@@ -171,13 +173,16 @@ export function createContinuations(
     host = dshHost(),
     locateDsh,
     codexServer,
+    claudeRuntime,
+    workspaceRoot = dataDir,
     openCodex = openCodexThread,
     launch = openTerminal,
     detect = id => agentExecutable(id, db),
     platform = process.platform,
   },
 ) {
-  const dispatchCodex = codexDispatcher(db, { detect, server: codexServer, open: openCodex });
+  const dispatchClaude = claudeDispatcher(db,{detect,dataDir:workspaceRoot,...claudeRuntime});
+  const dispatchCodex = codexDispatcher(db, { detect, dataDir:workspaceRoot, server: codexServer, open: openCodex });
   function requestRow(ref) {
     const fields =
       'c.id AS call_id,c.agent,c.protocol,c.session,c.started AS source_started,c.request';
@@ -193,17 +198,28 @@ export function createContinuations(
     if (!row) throw Error('The source request no longer exists.');
     return row;
   }
-  function codexTarget(row) {
+  function claudeTarget(row, request) {
+    let reason='';
+    try {
+      if (request !== undefined) claudePrompt(row,request);
+      if (!detect('claude')) throw Error('Claude Code is unavailable. Check its executable in Settings.');
+    } catch (e) { reason=e.message; }
+    return {id:'claude', reason, reopen:null};
+  }
+  function codexTarget(row, request) {
     let reason = '';
     try {
-      codexSource(row);
+      if (row.agent === 'codex') {
+        codexSource(row);
+        if (request !== undefined) codexChange(row,request);
+      } else if (request !== undefined) draftPrompt(row,request);
       if (platform !== 'darwin') throw Error('Opening a native agent currently requires macOS.');
       if (!detect('codex')) throw Error('Codex is unavailable. Check its executable in Settings.');
     } catch (e) {
       reason = e.message;
     }
     const previous =
-      !reason &&
+      !reason && row.agent === 'codex' &&
       db
         .query(
           "SELECT id FROM codex_dispatches WHERE call_id=? AND digest=? AND stage IN ('queued','opened') ORDER BY rowid DESC LIMIT 1",
@@ -212,16 +228,16 @@ export function createContinuations(
     return { id: 'codex', reason, reopen: previous?.id || null };
   }
   function dshRow(row, request) {
-    row.source_reply = db.query('SELECT reply FROM calls WHERE id=?').get(row.call_id)?.reply;
+    if (row.agent === 'dsh') row.source_reply = db.query('SELECT reply FROM calls WHERE id=?').get(row.call_id)?.reply;
     if (request !== undefined) row.body = JSON.stringify(request);
     return row;
   }
   function dshTarget(row) {
     let reason = '';
-    try { editedDshPrompt(row); host.client(); } catch (error) { reason = error.message; }
+    try { if(row.agent==='dsh') editedDshPrompt(row); else draftPrompt(row, JSON.parse(row.body)); host.client(); } catch (error) { reason = error.message; }
     return { id: 'dsh', reason, reopen: null };
   }
-  const resend = dshResender(db, host, locateDsh);
+  const resend = dshResender(db, host, locateDsh, row => newChatWorkspace(row,workspaceRoot));
   const sign = (id) =>
     createHmac('sha256', uiKey)
       .update('agent-chat-v1/' + id)
@@ -243,21 +259,12 @@ export function createContinuations(
     const candidates = new Set([original, ...connected.map((row) => row.value)]);
     return continuationTargets.filter((id) => candidates.has(id));
   }
-  async function options(run) {
-    if (
-      run.startsWith('capture/') ||
-      !db
-        .query(
-          "SELECT 1 FROM runs WHERE id=? AND kind='send' AND status='complete' AND reply IS NOT NULL",
-        )
-        .get(run)
-    ) {
+  async function options(run, request, mode='resend_prompt') {
+    if (mode !== 'continue_from_reply') {
       const row = requestRow(run);
-      let target;
-      if (row.agent === 'dsh') target = dshTarget(dshRow(row));
-      else if (row.agent === 'codex') target = codexTarget(row);
-      else throw Error('Select a completed replay run.');
-      return { original: row.agent, targets: [target], read: null, command: null };
+      return {original:row.agent, targets:[
+        claudeTarget(row,request),codexTarget(row,request),dshTarget(dshRow(row,request))
+      ], read:null, command:null};
     }
     const r = readRun(db, run);
     await refreshAgents();
@@ -279,8 +286,9 @@ export function createContinuations(
       read: plan?.call?.path || null,
       command: plan?.call?.command || null,
       targets: targets(r.agent).map((id) => {
-        if (id === 'codex') return codexTarget(r);
-        if (id === 'dsh') return dshTarget({ ...r, body: r.request });
+        if (id === 'claude' && request !== undefined) return claudeTarget(r, request);
+        if (id === 'codex') return codexTarget(r, request);
+        if (id === 'dsh') return dshTarget({ ...r, body: request === undefined ? r.request : JSON.stringify(request) });
         const chat = last.find((c) => c.target === id);
         return {
           id,
@@ -302,7 +310,7 @@ export function createContinuations(
     await launch(id);
     return { id, state: 'reopened' };
   }
-  async function start(run, { target, key, approvedFile, reopen: id, request }) {
+  async function start(run, { target, key, approvedFile, reopen: id, request, mode }) {
     if (!continuationTargets.includes(target)) throw Error('Unsupported continuation target.');
     if (id && target === 'codex') {
       const source = requestRow(run);
@@ -328,7 +336,13 @@ export function createContinuations(
     if (id && target === 'dsh') throw Error('DSH chats are reopened in the existing DSH workspace.');
     if (id) return reopen(run, id, target);
     if (typeof key !== 'string' || !uuid.test(key)) throw Error('Invalid launch identifier.');
+    if (target === 'claude' && mode !== 'continue_from_reply') {
+      const row = requestRow(run);
+      return dispatchClaude(row, request ?? JSON.parse(row.body), key);
+    }
     if (target === 'codex') {
+      if (request === undefined && approvedFile)
+        throw Error('Saved file-read approvals require the original agent protocol.');
       const row = requestRow(run),
         reason = codexTarget(row).reason;
       if (reason) throw Error(reason);
@@ -458,5 +472,5 @@ export function createContinuations(
       );
     }
   }
-  return { options, start, serve };
+  return { options, start, serve, claudeStatus: id => claudeJobStatus(db, id, detect, claudeRuntime?.lookupJob) };
 }

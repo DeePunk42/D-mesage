@@ -86,19 +86,19 @@ export function dshHost(discover = desktopHostOrigin, file) {
       rmSync(tmp, { force: true });
     }
   }
-  async function rpc(connection, method, args) {
+  async function rpc(connection, method, args, namespace = 'session') {
     if (method !== 'list' && active !== connection)
       throw Object.assign(Error('The DSH Host connection changed. Reconnect in Settings.'), {
         refused: true,
       });
     const rpcId = crypto.randomUUID();
-    const res = await send(connection.origin + '/api/session/' + method, {
+    const res = await send(connection.origin + '/api/' + namespace + '/' + method, {
       method: 'POST',
       headers: { 'content-type': 'application/json', cookie: connection.cookie },
       body: JSON.stringify({
         type: 'client-request',
         rpcId,
-        method: 'session/' + method,
+        method: namespace + '/' + method,
         payload: { args },
       }),
     });
@@ -214,6 +214,13 @@ export function dshHost(discover = desktopHostOrigin, file) {
       if (!connection) throw Error('Connect the running DSH Host in Settings.');
       return {
         origin: connection.origin,
+        async create(cwd, sessionId) {
+          const created = await rpc(connection, 'create', { request: { path: cwd } }, 'workspace');
+          if (!created?.workspace?.workspaceId) throw Error('DSH did not confirm the workspace.');
+          return rpc(connection, 'create', {
+            request: { workspaceId: created.workspace.workspaceId, sessionId },
+          });
+        },
         fork: (request) => rpc(connection, 'fork', { request }),
         prompt: (request) => rpc(connection, 'prompt', { request }),
       };

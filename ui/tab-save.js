@@ -73,6 +73,8 @@ export function draftWriter(tab, read, write, status) {
     return packet(text);
   }
   return {
+    get settled() { return !disposed && !changed && !sending && !failed; },
+    get revision() { return base.revision; },
     mark() {
       if (disposed) return;
       changed = true;

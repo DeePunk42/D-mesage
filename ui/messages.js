@@ -1,5 +1,5 @@
-import { requestEntries } from './protocols.js';
-import { itemLabel, toolLookup } from './response-items.js';
+import { requestEntries, responseMessages } from './protocols.js';
+import { itemLabel, toolLabel, toolLookup } from './response-items.js';
 
 // The wire role remains authoritative even when a text block contains role-like markup.
 export function compactText(value, limit = 130) {
@@ -62,6 +62,25 @@ export function requestPreview(protocol, body) {
   const lookup = protocol === 'responses' && last?.role === 'tool'
     ? toolLookup(entries.map(e => e.message)) : undefined;
   return { role: last?.role || '', text: messagePreview(last, lookup) };
+}
+export function previewTools(protocol, body, reply) {
+  const entries = body ? requestEntries(protocol,body).map(e=>e.message) : [];
+  const last = entries.at(-1), names = new Set();
+  const messages = [last,...(responseMessages(protocol,reply) || (Array.isArray(reply?.choices) ? reply.choices.map(c=>c?.message) : []))];
+  let lookup;
+  for (const msg of messages.filter(Boolean)) {
+    const items = [...(Array.isArray(msg.tool_calls) ? msg.tool_calls : []), ...(Array.isArray(msg.content) ? msg.content : [])];
+    if (msg.function_call) names.add(msg.function_call.name);
+    for (const item of [msg,...items]) {
+      if (!item) continue;
+      if (item.type?.endsWith?.('_output') || item.type==='tool_result' || item.role==='tool') {
+        lookup ??= toolLookup(entries);
+        names.add(item.name || toolLabel(lookup.get(item.tool_call_id || item.tool_use_id || item.call_id)));
+      } else if (item.function || item.type==='tool_use' || item.type==='server_tool_use' || item.type?.endsWith?.('_call'))
+        names.add(toolLabel(item) || item.type);
+    }
+  }
+  return [...names].filter(n=>typeof n==='string' && n);
 }
 export function pairingWarning(messages) {
   const waiting = new Map();

@@ -9,8 +9,8 @@ export function continuePicker({
   api,
   agentIcon,
   agentName,
-  confirmRead,
   currentRequest,
+  savedRevision,
 }) {
   let run = null,
     options = null,
@@ -23,14 +23,19 @@ export function continuePicker({
     generation = 0,
     loading = false;
   function targetHint() {
-    return (
-      options?.targets.find((t) => t.id === target)?.reason ||
-      (target === 'dsh'
-        ? 'Fork the source chat and resend its user prompt for a new answer.'
-        : options?.command
-          ? 'New chat workspace · ' + options.command
-          : '')
-    );
+    const selected = options?.targets.find((t) => t.id === target);
+    if (selected?.reason) return selected.reason;
+    if (
+      selected &&
+      options.original !== target &&
+      !(target === 'claude' && options.original === 'claude-code')
+    )
+      return 'Send the current user message to a new ' + agentName(target) + ' session.';
+    if (target === 'claude')
+      return 'Send the current request draft to a native Claude Code background session.';
+    if (target === 'dsh' || target === 'codex')
+      return 'Fork the source chat and send the current user message.';
+    return '';
   }
   function render() {
     root.hidden = !run;
@@ -55,6 +60,7 @@ export function continuePicker({
     choices.replaceChildren();
     for (const t of options?.targets || []) {
       const row = button('', () => {
+        clearTimeout(timer);
         target = t.id;
         key = null;
         menu.open = false;
@@ -103,9 +109,10 @@ export function continuePicker({
       if (g !== generation) return;
       options = data;
       if (!options.targets.some((item) => item.id === target)) {
-        const preferred = options.targets.find((item) => item.id === data.original)
-          ?? options.targets.find((item) => !item.reason)
-          ?? options.targets[0];
+        const preferred =
+          options.targets.find((item) => item.id === data.original) ??
+          options.targets.find((item) => !item.reason) ??
+          options.targets[0];
         target = preferred?.id ?? '';
       }
     } catch (e) {
@@ -117,68 +124,49 @@ export function continuePicker({
       }
     }
   }
-  async function watch(id, g, since = Date.now()) {
-    if (g !== generation) return;
+  async function watchClaude(id, job, g) {
+    if (generation !== g || busy || target !== 'claude') return;
     try {
-      const s = await api('continue-status/' + id);
-      if (g !== generation) return;
-      if (s.state === 'opening' || s.toolReceipt === 'pending') {
-        if (s.toolReceipt === 'pending')
-          message.textContent =
-            'Answer sent. Waiting for ' + agentName(target) + ' to return the tool result…';
-        if (Date.now() - since < 120000) {
-          timer = setTimeout(() => watch(id, g, since), 1500);
-        } else {
-          message.textContent =
-            'Still waiting. Check the agent window, or click again to check status.';
-          busy = false;
-          render();
-        }
-        return;
-      }
-      if (s.state !== 'delivered') message.textContent = s.error || 'Agent could not start.';
-      else if (s.toolReceipt === 'error')
-        message.textContent = agentName(target) + ' reported a tool error.';
-      else if (s.toolReceipt === 'returned')
-        message.textContent = agentName(target) + ' returned the tool result.';
-      else message.textContent = 'Answer sent to ' + agentName(target) + '.';
-      busy = false;
-      key = null;
-      render();
-    } catch (e) {
-      if (g === generation) {
-        message.textContent = e.message;
-        busy = false;
-        render();
-      }
+      const state = await api('continue-status/' + id);
+      if (generation !== g || busy || target !== 'claude') return;
+      const handle = state.job || job;
+      const status =
+        {
+          approval: 'Waiting for Claude Code approval',
+          waiting: 'Claude Code needs input',
+          idle: 'Claude Code is idle',
+          busy: 'Claude Code is working',
+          stopped: 'Claude Code stopped',
+          blocked: 'Claude Code needs attention',
+        }[state.activity] || 'Claude Code job ' + (state.activity || 'started');
+      message.textContent = status + ' · claude attach ' + handle;
+      if (state.activity === 'busy') timer = setTimeout(() => watchClaude(id, job, g), 3500);
+    } catch {
+      if (generation === g && !busy && target === 'claude')
+        message.textContent = 'Check the Claude Code job · claude attach ' + job;
     }
   }
   launch.onclick = async () => {
     if (!run || busy || launch.disabled) return;
-    const g = generation,
+    const g = ++generation,
       current = run,
       agent = target;
+    clearTimeout(timer);
     busy = true;
     menu.open = false;
     render();
     try {
-      if (!['codex','dsh'].includes(agent) && options.read && !(await confirmRead(agent, options.read))) {
-        if (g === generation) {
-          busy = false;
-          render();
-        }
-        return;
-      }
-      if (g !== generation) return;
-      const direct = agent === 'codex' || agent === 'dsh';
-      const request = direct ? currentRequest() : undefined;
+      const request = currentRequest();
       if (request !== sentDraft) key = null;
       sentDraft = request;
       key ??= crypto.randomUUID();
+      const revision = await savedRevision();
+      if (g !== generation) return;
       const s = await api('continue/' + current, {
         target: agent,
         key,
-        ...(direct ? {request} : {approvedFile: options.read}),
+        tab_ref: 'tab:' + tab,
+        revision,
       });
       if (g !== generation) return;
       if (agent === 'codex') {
@@ -188,6 +176,15 @@ export function continuePicker({
         render();
         return;
       }
+      if (agent === 'claude') {
+        message.textContent =
+          'Started in Claude Code · ' + (s.job ? 'claude attach ' + s.job : s.sessionId);
+        busy = false;
+        key = null;
+        render();
+        if (s.job) timer = setTimeout(() => watchClaude(s.id, s.job, g), 2000);
+        return;
+      }
       if (agent === 'dsh') {
         message.textContent = 'Prompt accepted in DSH · ' + s.sessionId;
         busy = false;
@@ -195,10 +192,9 @@ export function continuePicker({
         render();
         return;
       }
-      message.textContent = 'Waiting for ' + agentName(agent) + '…';
-      void watch(s.id, g);
     } catch (e) {
       if (g === generation) {
+        if (e.dispatchState === 'failed') key = null;
         message.textContent = e.message;
         busy = false;
         render();
@@ -217,15 +213,13 @@ export function continuePicker({
   document.addEventListener('pointerdown', (e) => {
     if (menu.open && !menu.contains(e.target)) menu.open = false;
   });
-  function view(source, selected) {
+  function view(source) {
     const tabId = source?.id;
-    const completedRun = selected?.entry_type === 'repeater' && selected.kind === 'send' && selected.status === 'complete';
-    const direct = source?.agent === 'codex' || source?.agent === 'dsh';
-    const next = completedRun ? selected.id : direct ? 'capture/' + source.call_id : null;
+    const next = source?.call_id ? 'capture/' + source.call_id : null;
     if (next === run && tabId === tab) return;
     generation++;
     clearTimeout(timer);
-    if (tab !== tabId || !target) target = source?.agent || selected?.agent || '';
+    if (tab !== tabId || !target) target = source?.agent || '';
     tab = tabId;
     run = next;
     options = null;

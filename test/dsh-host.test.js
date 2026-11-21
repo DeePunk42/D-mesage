@@ -33,7 +33,15 @@ test('existing-host authorization binds a private grant to its origin and verifi
       return Response.json({
         type: 'server-response',
         rpcId: wrongId ? 'other' : event.rpcId,
-        result: { ok: true, value: { items: [] } },
+        result: {
+          ok: true,
+          value:
+            event.method === 'workspace/create'
+              ? { workspace: { workspaceId: 'test-workspace' } }
+              : event.method === 'session/create'
+                ? { sessionId: event.payload.args.request.sessionId }
+                : { items: [] },
+        },
       });
     },
   });
@@ -54,6 +62,14 @@ test('existing-host authorization binds a private grant to its origin and verifi
     expect((await restored.settings()).connected).toBe(true);
     expect((await newHost().settings()).connected).toBe(true);
     expect(JSON.stringify(await restored.settings())).not.toContain('dsh-auth');
+    expect(await host.client().create('/tmp/test-workspace', 'session-new')).toEqual({
+      sessionId: 'session-new',
+    });
+    expect(calls.at(-2).payload.args.request).toEqual({ path: '/tmp/test-workspace' });
+    expect(calls.at(-1).payload.args.request).toEqual({
+      workspaceId: 'test-workspace',
+      sessionId: 'session-new',
+    });
     expect(calls[0].payload.args).toEqual({ _request: {} });
     wrongId = true;
     await expect(host.client().fork({ sessionId: 'example', atSeq: 1 })).rejects.toThrow('Invalid');

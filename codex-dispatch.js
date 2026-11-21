@@ -1,3 +1,4 @@
+import { draftPrompt, newChatWorkspace } from './agent-prompt.js';
 // Short-lived stdio sessions never resume the parent. The desktop is the only
 // client that resumes the queued child and owns its inference and approvals.
 import { spawn } from 'node:child_process';
@@ -207,30 +208,47 @@ export function codexRequestDigest(body) {
   return createHash('sha256').update(JSON.stringify(body)).digest('hex');
 }
 
-export function codexDispatcher(db, { detect, server = withServer, open = openCodexThread }) {
+export function codexDispatcher(
+  db,
+  { detect, dataDir, server = withServer, open = openCodexThread },
+) {
   const inflight = new Map();
   async function dispatch(row, body, id, digest) {
     const exe = detect('codex');
     if (!exe) throw Error('Codex is unavailable. Check its executable in Settings.');
-    const plan = codexChange(row, body);
+    const native = row.agent === 'codex';
+    const plan = native ? codexChange(row, body) : draftPrompt(row, body);
     let record = db.query('SELECT * FROM codex_dispatches WHERE id=?').get(id);
     if (record && (record.call_id !== row.call_id || record.digest !== digest))
       throw Error('This send ID belongs to a different request.');
     if (!record) {
       await server(exe, async (call) => {
-        const point = codexForkPoint(plan, await history(call, plan.threadId), row.source_started);
+        const point = native
+          ? codexForkPoint(plan, await history(call, plan.threadId), row.source_started)
+          : { input: [{ type: 'text', text: plan.prompt, text_elements: [] }] };
         db.query(
           "INSERT INTO codex_dispatches(id,call_id,digest,stage,input) VALUES(?,?,?,'forking',?)",
         ).run(id, row.call_id, digest, JSON.stringify(point.input));
         let fork;
         try {
-          fork = await call('thread/fork', {
-            threadId: plan.threadId,
-            beforeTurnId: point.beforeTurnId,
-            ephemeral: false,
-            excludeTurns: true,
-            deferGoalContinuation: true,
-          });
+          fork = native
+            ? await call('thread/fork', {
+                threadId: plan.threadId,
+                beforeTurnId: point.beforeTurnId,
+                ephemeral: false,
+                excludeTurns: true,
+                deferGoalContinuation: true,
+              })
+            : await call('thread/start', {
+                cwd: await newChatWorkspace(row, dataDir),
+                ephemeral: false,
+              });
+          // Naming materializes a new, empty session before the separate queue client opens it.
+          if (!native)
+            await call('thread/name/set', {
+              threadId: fork.thread.id,
+              name: 'D-message · ' + plan.prompt.trim().split('\n')[0].slice(0, 60),
+            });
         } catch (error) {
           if (error.rpcError) db.query('DELETE FROM codex_dispatches WHERE id=?').run(id);
           throw error;

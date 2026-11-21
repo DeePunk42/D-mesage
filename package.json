@@ -17,7 +17,7 @@
   },
   "magpie": {
     "name": "D-message",
-    "icon": "https://raw.githubusercontent.com/DeePunk42/D-mesage/main/page/icon.svg",
+    "icon": "https://raw.githubusercontent.com/DeePunk42/D-mesage/main/page/icon.png",
     "summary": {
       "en": "Inspect LLM traffic and replay edited requests from a local workspace.",
       "zh": "在本机查看大模型请求与响应，编辑请求并重放。"
@@ -25,7 +25,7 @@
     "hooks": "./capture.hooks.js",
     "page": {
       "title": "D-message",
-      "icon": "page/icon.svg",
+      "icon": "page/icon.png",
       "file": "page/start.html",
       "service": {
         "port": 34891,
@@ -34,6 +34,7 @@
     }
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.3.328",
     "@modelcontextprotocol/sdk": "1.32.2",
     "diff": "9.0.0",
     "zod": "4"

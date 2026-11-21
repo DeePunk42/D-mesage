@@ -1,10 +1,8 @@
-import { validRequest } from './ui/protocols.js';
 import { isDeepStrictEqual } from 'node:util';
 import {
   storage,
   checkLegacyOutcome,
   isReplayAgent,
-  reconcile,
   recording,
   setRecording,
   captureCursor,
@@ -14,7 +12,6 @@ import {
   saveScope,
 } from './store.js';
 import { z } from 'zod';
-import { launch } from './replay.js';
 
 const ids = z.array(z.string().trim().min(1)).transform((values) => [...new Set(values)].sort());
 const agentIds = ids.refine((a) => !a.some(isReplayAgent), 'Choose a client other than D-message.');
@@ -24,7 +21,7 @@ export const scopeSchema = z.strictObject({
     agentIds.refine((a) => a.length > 0),
   ]),
 });
-const scopeEditSchema = z.strictObject({
+export const scopeEditSchema = z.strictObject({
   agents: z.union([z.literal('all'), agentIds]),
   add: agentIds.default([]),
   remove: ids.default([]),
@@ -54,21 +51,6 @@ export function recordState(action, scope, edits) {
       };
     })
     .immediate();
-}
-
-export function listTraces({ after = 0, session, limit = 25 }) {
-  const db = storage();
-  reconcile();
-  const filter = session === undefined ? '' : ' AND session=?';
-  const params = session === undefined ? [after, limit + 1] : [after, session, limit + 1];
-  const rows = db
-    .query(
-      `SELECT rowid AS cursor,id,session,agent,model,protocol,endpoint,status,started,ended,last_role,last_preview
-    FROM calls WHERE rowid>? ${filter} ORDER BY rowid LIMIT ?`,
-    )
-    .all(...params);
-  const traces = rows.slice(0, limit).map(({ id, ...row }) => ({ ref: 'trace:' + id, ...row }));
-  return { traces, cursor: traces.at(-1)?.cursor ?? after, has_more: rows.length > limit };
 }
 
 export function snapshot(ref) {
@@ -114,17 +96,10 @@ function lookup(obj, tokens) {
   }
   return obj;
 }
-export function getTrace({ ref, view = 'summary', path = '' }) {
-  reconcile();
-  const { request, reply, call_id, ...info } = snapshot(ref);
-  const meta = { ref, trace_ref: 'trace:' + call_id, ...info };
-  const value =
-    view === 'summary' ? meta : JSON.parse((view === 'request' ? request : reply) ?? 'null');
-  return { ...meta, view, value: lookup(value, parts(path)) };
+export function valueAt(obj, path = '') {
+  return lookup(obj, parts(path));
 }
-export function editTrace({ ref, ops }) {
-  const source = snapshot(ref);
-  let body = JSON.parse(source.request);
+export function patchRequest(body, ops) {
   for (const [i, op] of ops.entries()) {
     try {
       const keys = parts(op.path);
@@ -165,38 +140,5 @@ export function editTrace({ ref, ops }) {
       throw Error('Operation ' + (i + 1) + ' (' + op.path + '): ' + e.message);
     }
   }
-  if (
-    !body ||
-    body.model !== source.model ||
-    !validRequest(source.protocol, body) ||
-    (source.protocol !== 'responses' && body.messages.some((m) => !m || typeof m.role !== 'string'))
-  )
-    throw Error('A draft requires the original model and valid native protocol input.');
-  const id = crypto.randomUUID();
-  storage()
-    .query('INSERT INTO experiments(id,call_id,created,body) VALUES(?,?,?,?)')
-    .run(id, source.call_id, Date.now(), JSON.stringify(body));
-  return {
-    draft_ref: 'draft:' + id,
-    parent_ref: ref,
-    trace_ref: 'trace:' + source.call_id,
-    paths: ops.filter((o) => o.op !== 'test').map((o) => o.path),
-  };
-}
-export function repeatTrace({ ref, request_key }, upstream) {
-  const s = snapshot(ref);
-  const id = launch(
-    { id: s.call_id, model: s.model, protocol: s.protocol, endpoint: s.endpoint },
-    JSON.parse(s.request),
-    upstream,
-    {
-      ref,
-      key: request_key,
-    },
-  );
-  return {
-    run_ref: 'run:' + id,
-    trace_ref: 'trace:' + s.call_id,
-    status: storage().query('SELECT status FROM runs WHERE id=?').get(id).status,
-  };
+  return body;
 }

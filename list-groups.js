@@ -128,7 +128,7 @@ export function groupRows(rows) {
       group.last = row.started;
       group.latest = row;
     }
-    if (row.hit !== undefined) group.matches.push({ id: row.id, hit: row.hit });
+    if (row.hit !== undefined) group.matches.push({ id: row.id, entry_type: row.entry_type, hit: row.hit });
   }
   for (const group of groups.values()) {
     Object.assign(group, {

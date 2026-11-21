@@ -1,3 +1,4 @@
+import { draftPrompt } from './agent-prompt.js';
 // A user-authored event anchors the fork. Any edited user-role text, including
 // context supplied by DSH, can be the new prompt on that branch.
 import { createHash } from 'node:crypto';
@@ -61,9 +62,8 @@ export function editedDshPrompt(r) {
     : Array.isArray(blocks)
       ? blocks.filter((b) => b.type === 'tool_use').map((b) => b.id)
       : [];
-  if (!text && !tools.length) throw Error('The source trace has no reply to locate its DSH turn.');
   const inputs = original.map((m) => (m.role === 'user' ? joined(textParts(m.content)) : null));
-  return { change, inputs, text, tools };
+  return { change, inputs, text, tools, started: r.source_started };
 }
 
 // Repeated wire text can belong to different turns. Use its occurrence in the
@@ -75,7 +75,7 @@ function ownerAt(inputs, index, owners) {
     return owners[0];
 }
 
-function promptAtReply(plan, prompts, editedOwners) {
+function promptAtCapture(plan, prompts, editedOwners) {
   let target = prompts.at(-1);
   if (plan.change) {
     let index = plan.change.index;
@@ -124,6 +124,10 @@ async function matchFile(path, plan) {
   let sessionId,
     turnEnd = -1;
   let inTurn = false;
+  // A canceled/pending capture may have no reply receipt. Match its timestamp
+  // inside a native step and verify the user input in that step's request.
+  const timeMatch = !plan.text && !plan.tools.length && Number.isFinite(plan.started);
+  let stepTime, pointAtStart;
   const prompts = [],
     matches = [],
     queued = new Map(),
@@ -131,7 +135,7 @@ async function matchFile(path, plan) {
   try {
     for await (const line of lines) {
       if (!line.trim()) continue;
-      const { type, seq, data, id } = JSON.parse(line);
+      const { type, seq, data, id, time } = JSON.parse(line);
       if (type === 'session') sessionId = id;
       if (type === 'turn/start') inTurn = true;
       if (type === 'turn/end') {
@@ -140,7 +144,10 @@ async function matchFile(path, plan) {
       }
       // A restored session can have ordinary end-seed markers after its own
       // replies. Only a fork's inherited marker identifies copied receipts.
-      if (type === 'session/end-seed' && data?.inherited === true) matches.length = 0;
+      if (type === 'session/end-seed' && data?.inherited === true) {
+        matches.length = 0;
+        pointAtStart = null;
+      }
       if (type === 'agent/inbox/spliced') {
         for (const input of data.inserted || []) {
           if (input.source?.kind === 'user' && input.id) queued.set(input.id, inTurn ? -1 : seq);
@@ -157,6 +164,27 @@ async function matchFile(path, plan) {
         }
         if (plan.change && text === plan.change.before) editedOwners.push(prompts.at(-1));
       }
+      if (timeMatch) {
+        if (type === 'step/start') {
+          stepTime = time;
+          pointAtStart = null;
+        }
+        if (
+          Number.isFinite(stepTime) &&
+          stepTime <= plan.started &&
+          time <= plan.started &&
+          (type === 'user/message' || type === 'step/start')
+        ) {
+          pointAtStart = plan.inputs.includes(prompts.at(-1)?.text)
+            ? promptAtCapture(plan, prompts, editedOwners)
+            : null;
+        }
+        if (type === 'step/end' || type === 'turn/end') {
+          if (pointAtStart && time >= plan.started) matches.push({ sessionId, ...pointAtStart });
+          stepTime = pointAtStart = null;
+        }
+        continue;
+      }
       if (type !== 'assistant/message') continue;
       const content = data.message.content;
       if (!Array.isArray(content)) continue;
@@ -171,7 +199,7 @@ async function matchFile(path, plan) {
         )
       )
         continue;
-      matches.push({ sessionId, ...promptAtReply(plan, prompts, editedOwners) });
+      matches.push({ sessionId, ...promptAtCapture(plan, prompts, editedOwners) });
     }
   } finally {
     lines.close();
@@ -179,6 +207,7 @@ async function matchFile(path, plan) {
     if (reader && (await reader.exited) !== 0)
       throw Error('Could not read the compressed DSH session log.');
   }
+  if (timeMatch && pointAtStart) matches.push({ sessionId, ...pointAtStart });
   return matches;
 }
 
@@ -208,7 +237,7 @@ export async function locateDshPrompt(
     }
   }
   if (!matches.length)
-    throw Error('The original trace reply was not found in the local DSH v4 session history.');
+    throw Error('Could not locate the captured request in the local DSH v4 session history.');
   if (matches.length !== 1 || !matches[0])
     throw Error('Could not uniquely locate the source reply in the local DSH history.');
   if (matches[0].error) throw Error(matches[0].error);
@@ -217,7 +246,7 @@ export async function locateDshPrompt(
 
 // Record the child ID before submitting its prompt. session.prompt deduplicates
 // requestId; session.fork has no caller-supplied id and cannot be blindly retried.
-export function dshResender(db, host, locate = locateDshPrompt) {
+export function dshResender(db, host, locate = locateDshPrompt, workspace) {
   const inflight = new Map();
   async function run(r, key, digest) {
     const client = host.client();
@@ -246,14 +275,23 @@ export function dshResender(db, host, locate = locateDshPrompt) {
             'Fork delivery is unconfirmed. Check the DSH workspace before starting another resend.',
         );
     }
-    const plan = previous ? JSON.parse(previous.plan) : await locate(r);
+    const plan = previous
+      ? JSON.parse(previous.plan)
+      : r.agent === 'dsh'
+        ? await locate(r)
+        : {
+            cwd: await workspace(r),
+            content: [{ type: 'text', text: draftPrompt(r, JSON.parse(r.body)).prompt }],
+          };
     let child = previous?.child;
     if (!child) {
       db.query(
         "INSERT INTO dsh_dispatches(id,call_id,digest,origin,plan,state) VALUES(?,?,?,?,?,'opening')",
       ).run(key, r.call_id, digest, client.origin, JSON.stringify(plan));
       try {
-        const result = await client.fork({ sessionId: plan.sessionId, atSeq: plan.atSeq });
+        const result = plan.cwd
+          ? await client.create(plan.cwd, 'session-' + key)
+          : await client.fork({ sessionId: plan.sessionId, atSeq: plan.atSeq });
         if (
           typeof result?.sessionId !== 'string' ||
           !result.sessionId ||

@@ -1,6 +1,6 @@
 import { nativeReply, nativeStream, replyError, sseData } from './native-reply.js';
 import { validRequest, endpointFor } from './ui/protocols.js';
-import { pairingWarning, requestPreview } from './ui/messages.js';
+import { pairingWarning, requestPreview, previewTools } from './ui/messages.js';
 import { finalPreview } from './ui/response-items.js';
 import { storage } from './store.js';
 
@@ -136,7 +136,7 @@ export function launch(call, body, upstream, repeat) {
     protocol === 'chat' ? upstream : new URL(endpointFor(protocol, call.endpoint), upstream);
   const db = storage(),
     id = crypto.randomUUID(),
-    exp = repeat?.ref.startsWith('draft:') ? repeat.ref.slice(6) : crypto.randomUUID(),
+    exp = crypto.randomUUID(),
     started = Date.now();
   const accepted = db
     .transaction(() => {
@@ -163,17 +163,15 @@ export function launch(call, body, upstream, repeat) {
         db.query('SELECT count(*) AS n FROM replay_jobs WHERE owner IS NULL').get().n >= queueLimit
       )
         throw Error('Replay queue is full. Try again after a run starts.');
-      if (!repeat?.ref.startsWith('draft:')) {
-        db.query('INSERT INTO experiments(id,call_id,created,body) VALUES(?,?,?,?)').run(
-          exp,
-          call.id,
-          started,
-          JSON.stringify(body),
-        );
-      }
+      db.query('INSERT INTO experiments(id,call_id,created,body) VALUES(?,?,?,?)').run(
+        exp,
+        call.id,
+        started,
+        JSON.stringify(body),
+      );
       const last = requestPreview(protocol, body);
       db.query(
-        "INSERT INTO runs(id,experiment_id,kind,started,status,owner,last_role,last_preview,tab_id,model,preview_version) VALUES(?,?,'send',?,'queued',?,?,?,?,?,1)",
+        "INSERT INTO runs(id,experiment_id,kind,started,status,owner,last_role,last_preview,tab_id,model,preview_version,request_tools) VALUES(?,?,'send',?,'queued',?,?,?,?,?,1,?)",
       ).run(
         id,
         exp,
@@ -183,6 +181,7 @@ export function launch(call, body, upstream, repeat) {
         last.text,
         call.tabId ?? null,
         body.model,
+        JSON.stringify(previewTools(protocol,body)),
       );
       db.query('INSERT INTO replay_jobs(run_id,destination) VALUES(?,?)').run(
         id,
@@ -285,13 +284,14 @@ async function executeReplay(db, { id, destination, protocol, experiment }) {
     error = response && !response.ok ? 'Gateway HTTP ' + response.status + ' · ' + message : message;
   }
   db.transaction(() => {
-    db.query('UPDATE runs SET status=?,error=?,failure=?,ended=?,reply=?,final_preview=? WHERE id=?').run(
+    db.query('UPDATE runs SET status=?,error=?,failure=?,ended=?,reply=?,final_preview=?,response_tools=? WHERE id=?').run(
       status,
       error ?? null,
       failure ? JSON.stringify(failure) : null,
       Date.now(),
       reply == null ? null : JSON.stringify(reply),
       finalPreview(reply),
+      JSON.stringify(previewTools(protocol,null,reply)),
       id,
     );
     db.query('DELETE FROM replay_jobs WHERE run_id=?').run(id);

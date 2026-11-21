@@ -11,13 +11,13 @@
 安装 Magpie 后，添加已发布的 npm 包：
 
 ```sh
-magpie plugin add npm:magpie-page-d-message@0.0.1
+magpie plugin add npm:magpie-page-d-message@1.0.0
 ```
 
 也可从 GitHub 安装同一版本：
 
 ```sh
-magpie plugin add github:DeePunk42/D-mesage#v0.0.1
+magpie plugin add github:DeePunk42/D-mesage#v1.0.0
 ```
 
 ## 录制和重放一条请求
@@ -72,6 +72,8 @@ Claude Code 需要已信任的工作目录，以及后台进程可用的登录�
 可设置 `D_MESSAGE_DATA_DIR` 指定其他目录。
 
 ## MCP
+
+从 0.0.1 升级后，请在 MCP 客户端刷新工具列表。用 `recording` 控制录制，`trace_find` 和 `trace_read` 检索并查看记录。编辑与重放时，先用 `repeater_open` 打开共享标签，再用 `repeater_tab` 编辑草稿，最后调用 `repeater_send_model`。
 
 MCP 监听默认关闭。在 **Settings → MCP server** 启用监听，选择本机端口，再点击 **Apply**。可用 **Copy client config**，或手动配置界面显示的 Streamable HTTP 地址（默认为 `http://127.0.0.1:34892/mcp`），并添加 `Authorization: Bearer <访问令牌>` 请求头。持有令牌的本机客户端可以读取录制正文、修改共享草稿、发起计费推理，以及向具备原生工具的 Agent 发送请求。
 

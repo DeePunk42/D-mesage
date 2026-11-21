@@ -11,13 +11,13 @@ Trace and inspect model requests and responses through the Magpie gateway. Edit 
 With Magpie installed, add the published npm package:
 
 ```sh
-magpie plugin add npm:magpie-page-d-message@0.0.1
+magpie plugin add npm:magpie-page-d-message@1.0.0
 ```
 
 You can also install the same version from GitHub:
 
 ```sh
-magpie plugin add github:DeePunk42/D-mesage#v0.0.1
+magpie plugin add github:DeePunk42/D-mesage#v1.0.0
 ```
 
 ## Record and replay a request
@@ -72,6 +72,8 @@ Configure Codex and Claude Code executable paths in **Settings → Replay agents
 Set `D_MESSAGE_DATA_DIR` to use a different directory.
 
 ## MCP
+
+Upgrading from 0.0.1? Refresh the MCP tool list in your client. Use `recording` for capture control and `trace_find` / `trace_read` for inspection. To edit and replay, open a shared tab with `repeater_open`, edit it with `repeater_tab`, then call `repeater_send_model`.
 
 The MCP listener is off by default. In **Settings → MCP server**, enable the listener, choose a local port, and click **Apply**. Use **Copy client config**, or configure Streamable HTTP at the displayed address (default `http://127.0.0.1:34892/mcp`) with `Authorization: Bearer <access-token>`. Local clients with the token can read captures, edit shared drafts, start billable model runs, and send requests to agents with native tools.
 

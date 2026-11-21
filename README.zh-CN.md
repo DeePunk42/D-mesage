@@ -11,13 +11,13 @@
 安装 Magpie 后，添加已发布的 npm 包：
 
 ```sh
-magpie plugin add npm:magpie-page-d-message@1.0.0
+magpie plugin add npm:magpie-page-d-message@1.0.1
 ```
 
 也可从 GitHub 安装同一版本：
 
 ```sh
-magpie plugin add github:DeePunk42/D-mesage#v1.0.0
+magpie plugin add github:DeePunk42/D-message#v1.0.1
 ```
 
 ## 录制和重放一条请求

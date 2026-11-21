@@ -3,10 +3,12 @@
   "description": "Capture, inspect, edit and replay LLM requests through Magpie.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/DeePunk42/D-mesage.git"
+    "url": "git+https://github.com/DeePunk42/D-message.git"
   },
+  "homepage": "https://github.com/DeePunk42/D-message#readme",
+  "bugs": { "url": "https://github.com/DeePunk42/D-message/issues" },
   "keywords": ["magpie-plugin", "magpie-page", "llm-debugging"],
-  "version": "1.0.0",
+  "version": "1.0.1",
   "license": "MIT",
   "type": "module",
   "main": "./plugin.js",
@@ -17,7 +19,7 @@
   },
   "magpie": {
     "name": "D-message",
-    "icon": "https://raw.githubusercontent.com/DeePunk42/D-mesage/v1.0.0/page/icon.png",
+    "icon": "https://raw.githubusercontent.com/DeePunk42/D-message/v1.0.1/page/icon.png",
     "summary": {
       "en": "Inspect LLM traffic and replay edited requests from a local workspace.",
       "zh": "在本机查看大模型请求与响应，编辑请求并重放。"
